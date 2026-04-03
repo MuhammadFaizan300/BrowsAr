@@ -18,7 +18,15 @@ def forensic_triage_v20():
 
     # 2. Launch Brave as a "Zombie" process (Headless + Debugging)
     # This makes Brave think it's just doing a normal startup
-    cmd = f'"{BRAVE_PATH}" --remote-debugging-port=9222 --user-data-dir="{USER_DATA_DIR}" --headless --disable-gpu'
+    cmd = (
+            f'"{BRAVE_PATH}" '
+            f'--remote-debugging-port=9222 '
+            f'--user-data-dir="{USER_DATA_DIR}" '
+            f'--remote-allow-origins=* '
+            f'--headless '
+            f'--disable-gpu '
+            f'--no-sandbox' # Added for extra stability in VM environments
+            )
     subprocess.Popen(cmd, shell=True)
     time.sleep(5) # Give the Elevation Service time to verify and start
 
