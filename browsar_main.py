@@ -44,13 +44,11 @@ def impersonate_system():
     except: return False
 
 # --- 2. PHYSICAL DISK MAPPER ---
-# Manual definition to avoid win32ioctlcon dependency errors
 FSCTL_GET_RETRIEVAL_POINTERS = 0x00090073
 
 class DiskMapper:
     @staticmethod
     def get_physical_offset(file_path, logical_offset):
-        """Translates a file-relative offset to an absolute physical disk offset."""
         try:
             drive = os.path.splitdrive(file_path)[0] + "\\"
             sectors_per_cluster, bytes_per_sector, _, _ = win32api.GetDiskFreeSpace(drive)
@@ -63,13 +61,11 @@ class DiskMapper:
             )
 
             in_buf = struct.pack("<Q", 0) 
-            # Use the manually defined constant here
             out_buf = win32file.DeviceIoControl(h_file, FSCTL_GET_RETRIEVAL_POINTERS, in_buf, 1024)
             h_file.Close()
 
             extent_count = struct.unpack("<I", out_buf[:4])[0]
             starting_vcn = struct.unpack("<Q", out_buf[8:16])[0]
-            
             target_cluster = logical_offset // cluster_size
             current_vcn = starting_vcn
             
@@ -77,12 +73,10 @@ class DiskMapper:
             for i in range(extent_count):
                 next_vcn = struct.unpack("<Q", out_buf[ptr:ptr+8])[0]
                 lcn = struct.unpack("<q", out_buf[ptr+8:ptr+16])[0]
-                
                 if current_vcn <= target_cluster < next_vcn:
                     cluster_offset = target_cluster - current_vcn
                     physical_byte = (lcn + cluster_offset) * cluster_size
                     return physical_byte + (logical_offset % cluster_size)
-                
                 current_vcn = next_vcn
                 ptr += 16
             return 0
@@ -93,13 +87,12 @@ class HexEngine:
     @staticmethod
     def get_hex_dump(file_path, offset=0, page_size=4096, physical_mode=False):
         if not file_path or not os.path.exists(file_path): return "[-] Artifact File Not Found."
-        
         phys_base = DiskMapper.get_physical_offset(file_path, offset) if physical_mode else 0
-        
         try:
             with open(file_path, 'rb') as f:
                 f.seek(offset); data = f.read(page_size)
-                header = f"[*] SOURCE: {os.path.basename(file_path)} | MODE: {'PHYSICAL' if physical_mode else 'RELATIVE'}\n"
+                header = f"[*] SOURCE: {file_path}\n"
+                header += f"[*] MODE: {'PHYSICAL' if physical_mode else 'RELATIVE'}\n"
                 header += "Offset    00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F  |  ASCII\n"
                 sep =    "--------  -----------------------------------------------  |  ----------------\n"
                 output = [header, sep]
@@ -121,7 +114,7 @@ class AnalysisWindow(ctk.CTkToplevel):
         style.configure("Treeview", background="#1a1a1a", foreground="white", fieldbackground="#1a1a1a", borderwidth=0)
         style.configure("Treeview.Heading", background="#333333", foreground="white", relief="flat")
         self.tree = ttk.Treeview(self, columns=columns, show='headings')
-        for col in columns: self.tree.heading(col, text=col.upper()); self.tree.column(col, width=400, anchor="w")
+        for col in columns: self.tree.heading(col, text=col.upper()); self.tree.column(col, width=200, anchor="w")
         for row in data: self.tree.insert("", "end", values=row)
         self.tree.pack(fill="both", expand=True, padx=10, pady=10)
 
@@ -167,7 +160,9 @@ class BrowsAR_App(ctk.CTk):
         self.toggle_btn = ctk.CTkButton(control_frame, text="MODE: RELATIVE", fg_color="#333333", command=self.toggle_address_mode); self.toggle_btn.pack(side="right", padx=10)
 
         self.tabview = ctk.CTkTabview(self.main_view, command=self.on_tab_changed); self.tabview.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-        tabs = ["Hex Explorer", "Passwords", "History", "Registry", "Prefetch"]
+        
+        # ADDED "Downloads" TO TABS
+        tabs = ["Hex Explorer", "Passwords", "History", "Downloads", "Registry", "Prefetch"]
         if name == "Brave": tabs.append("Cookies")
         
         for t in tabs: 
@@ -242,7 +237,12 @@ class BrowsAR_App(ctk.CTk):
         self.on_tab_changed()
 
     def get_artifact_path(self, active):
-        t = {"Passwords": "Login Data", "History": "History", "Cookies": "Cookies"}.get(active, "Local State")
+        # PRIORITY ROOT CHECK (Fixes Chrome mismatch)
+        t = {"Passwords": "Login Data", "History": "History", "Downloads": "History", "Cookies": "Cookies"}.get(active, "Local State")
+        
+        root_check = os.path.join(self.current_browser_path, t)
+        if os.path.exists(root_check) and not os.path.isdir(root_check): return root_check
+
         for r, d, f in os.walk(self.current_browser_path):
             if t in f: return os.path.join(r, t)
         return None
@@ -251,9 +251,31 @@ class BrowsAR_App(ctk.CTk):
         tab = self.tabview.get()
         if tab == "Passwords": self.analyze_passwords()
         elif tab == "History": self.analyze_history()
+        elif tab == "Downloads": self.analyze_downloads()
         elif tab == "Registry": self.analyze_registry_deep()
         elif tab == "Prefetch": self.analyze_prefetch_deep()
         elif tab == "Cookies": self.analyze_brave_cookies()
+
+    # --- 6. FORENSIC ANALYSIS ENGINE ---
+    def analyze_downloads(self):
+        path = self.get_artifact_path("Downloads")
+        if not path: return
+        temp = "temp_dw.db"; shutil.copyfile(path, temp)
+        try:
+            conn = sqlite3.connect(temp); cur = conn.cursor()
+            query = "SELECT target_path, start_time, received_bytes, state, tab_url FROM downloads"
+            cur.execute(query)
+            res = []
+            for row in cur.fetchall():
+                # Forensic conversion for Chrome timestamps
+                ts = (datetime.datetime(1601, 1, 1) + datetime.timedelta(microseconds=row[1])).strftime('%Y-%m-%d %H:%M') if row[1] > 0 else "N/A"
+                size = f"{row[2]/1024:.1f} KB"
+                status = "Complete" if row[3] == 1 else "Incomplete/Failed"
+                res.append((row[0], ts, size, status, row[4]))
+            conn.close(); os.remove(temp)
+            self.last_results, self.last_headers = res, ["Local Path", "Time", "Size", "Status", "Source URL"]
+            AnalysisWindow(f"{self.current_browser_name} Downloads", self.last_headers, res)
+        except Exception as e: messagebox.showerror("Forensic Error", str(e))
 
     def analyze_registry_deep(self):
         targets, res = self.get_reg_targets(), []
@@ -283,6 +305,7 @@ class BrowsAR_App(ctk.CTk):
             final_key = win32crypt.CryptUnprotectData(s1, None, None, None, 0)[1][-32:]
         else:
             final_key = win32crypt.CryptUnprotectData(base64.b64decode(ls["os_crypt"]["encrypted_key"])[5:], None, None, None, 0)[1]
+        
         db_path = self.get_artifact_path("Passwords"); temp_db = "temp_pass.db"; shutil.copyfile(db_path, temp_db)
         res = []
         conn = sqlite3.connect(temp_db); cur = conn.cursor(); cur.execute("SELECT origin_url, username_value, password_value FROM logins")
@@ -314,8 +337,8 @@ class BrowsAR_App(ctk.CTk):
         AnalysisWindow(f"{self.current_browser_name} Prefetch", self.last_headers, res)
 
     def analyze_brave_cookies(self):
-        brave_exe = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
         subprocess.run("taskkill /F /IM brave.exe /T", shell=True, capture_output=True); time.sleep(2)
+        brave_exe = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
         cmd = f'"{brave_exe}" --remote-debugging-port=9222 --user-data-dir="{self.current_browser_path}" --headless --disable-gpu'
         subprocess.Popen(cmd, shell=True); time.sleep(5)
         try:
