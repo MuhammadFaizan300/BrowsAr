@@ -42,24 +42,37 @@ def impersonate_system():
         return True
     except: return False
 
-# --- 2. FORENSIC ENGINES ---
+# --- 2. FORENSIC HEX ENGINE ---
 class HexEngine:
     @staticmethod
     def get_hex_dump(file_path, max_bytes=8192):
-        if not os.path.exists(file_path): return "[-] File Not Found or Access Denied."
+        if not file_path or not os.path.exists(file_path): 
+            return "[-] Artifact File Not Found.\n[*] Run Analysis to locate or verify path."
+        
         header = "Offset    00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F  |  ASCII\n"
         sep =    "--------  -----------------------------------------------  |  ----------------\n"
         output = [header, sep]
         try:
-            with open(file_path, 'rb') as f:
+            # For locked system files (Registry), we try a temp copy first
+            temp_view = "view_tmp.bin"
+            try:
+                shutil.copyfile(file_path, temp_view)
+                target = temp_view
+            except:
+                target = file_path
+
+            with open(target, 'rb') as f:
                 data = f.read(max_bytes)
                 for i in range(0, len(data), 16):
                     chunk = data[i:i+16]
                     hex_p = ' '.join(f"{b:02x}" for b in chunk)
                     asc_p = ''.join(chr(b) if 32 <= b <= 126 else "." for b in chunk)
                     output.append(f"{i:08x}  {hex_p:<48}  |  {asc_p}\n")
+            
+            if os.path.exists(temp_view): os.remove(temp_view)
             return "".join(output)
-        except: return "[-] Read Error (File locked)."
+        except Exception as e: 
+            return f"[-] Read Error: {e}\n[*] File may be locked by another process."
 
 class BrowserScanner:
     @staticmethod
@@ -105,9 +118,11 @@ class BrowsAR_App(ctk.CTk):
         
         self.current_browser_path = ""
         self.current_browser_name = ""
+        self.displays = {}  # Store references to textboxes for each tab
         self.last_results = []
         self.last_headers = []
 
+        # UI Setup
         self.sidebar = ctk.CTkFrame(self, width=240, corner_radius=0)
         self.sidebar.pack(side="left", fill="y")
         self.logo_label = ctk.CTkLabel(self.sidebar, text="Brows-AR", font=("Consolas", 28, "bold"))
@@ -121,7 +136,7 @@ class BrowsAR_App(ctk.CTk):
         self.main_view = ctk.CTkFrame(self, corner_radius=15, fg_color="#121212")
         self.main_view.pack(side="right", fill="both", expand=True, padx=20, pady=20)
         
-        self.welcome_text = ctk.CTkLabel(self.main_view, text="[*] SYSTEM TRIAGE COMPLETE\n\nSELECT A TARGET", font=("Consolas", 16))
+        self.welcome_text = ctk.CTkLabel(self.main_view, text="[*] SYSTEM TRIAGE COMPLETE\n\nSELECT A SOURCE", font=("Consolas", 16))
         self.welcome_text.place(relx=0.5, rely=0.5, anchor="center")
 
     def load_browser_cockpit(self, name, path):
@@ -143,47 +158,61 @@ class BrowsAR_App(ctk.CTk):
         self.tabview = ctk.CTkTabview(self.main_view, segmented_button_selected_color="#1f538d", command=self.on_tab_changed)
         self.tabview.pack(fill="both", expand=True, padx=20, pady=(0, 20))
         
-        # Tabs for all browsers
         tabs = ["Hex Explorer", "Passwords", "History", "Registry", "Prefetch"]
         if name == "Brave": tabs.append("Cookies")
         
-        for t in tabs: self.tabview.add(t)
+        self.displays = {}
+        for t in tabs: 
+            self.tabview.add(t)
+            # Create a hex display textbox for EVERY tab
+            txt = ctk.CTkTextbox(self.tabview.tab(t), font=("Consolas", 14), wrap="none", fg_color="#000000", text_color="#ffffff")
+            txt.pack(fill="both", expand=True, padx=10, pady=10)
+            self.displays[t] = txt
 
-        self.hex_display = ctk.CTkTextbox(self.tabview.tab("Hex Explorer"), font=("Consolas", 14), wrap="none", fg_color="#000000")
-        self.hex_display.pack(fill="both", expand=True, padx=10, pady=10)
         self.on_tab_changed()
 
     def on_tab_changed(self):
         active = self.tabview.get()
-        self.hex_display.delete("0.0", "end")
+        if active not in self.displays: return
         
+        current_txt = self.displays[active]
+        current_txt.delete("0.0", "end")
+        
+        # --- SMART ARTIFACT MAPPING ---
         target_file = None
         if active == "Passwords":
-            t = "Login Data"
+            t_name = "Login Data"
             for r, d, f in os.walk(self.current_browser_path):
-                if t in f: target_file = os.path.join(r, t); break
+                if t_name in f: target_file = os.path.join(r, t_name); break
         elif active == "History":
-            t = "History"
+            t_name = "History"
             for r, d, f in os.walk(self.current_browser_path):
-                if t in f: target_file = os.path.join(r, t); break
+                if t_name in f: target_file = os.path.join(r, t_name); break
+        elif active == "Cookies":
+            t_name = "Cookies"
+            for r, d, f in os.walk(self.current_browser_path):
+                if t_name in f: target_file = os.path.join(r, t_name); break
         elif active == "Registry":
-            target_file = r"C:\Windows\System32\config\SOFTWARE"
+            target_file = r"C:\Windows\System32\config\SOFTWARE" # Default hive view
         elif active == "Prefetch":
             exe_map = {"Brave": "BRAVE.EXE", "Chrome": "CHROME.EXE", "Edge": "MSEDGE.EXE"}
             prefix = exe_map.get(self.current_browser_name, "")
             pf_dir = r"C:\Windows\Prefetch"
             if os.path.exists(pf_dir):
-                pfs = [os.path.join(pf_dir, f) for f in os.listdir(pf_dir) if f.startswith(prefix)]
+                pfs = [os.path.join(pf_dir, f) for f in os.listdir(pf_dir) if f.upper().startswith(prefix)]
                 if pfs: target_file = max(pfs, key=os.path.getmtime)
-        else:
-            t = "Local State"
+        else: # Default/Hex Explorer
+            t_name = "Local State"
             for r, d, f in os.walk(self.current_browser_path):
-                if t in f: target_file = os.path.join(r, t); break
+                if t_name in f: target_file = os.path.join(r, t_name); break
 
-        if target_file and os.path.exists(target_file):
-            self.hex_display.insert("end", f"[*] HEX OBSERVER: MAPPING {active.upper()} CONTEXT\n")
-            self.hex_display.insert("end", f"[*] SOURCE: {target_file}\n" + "="*80 + "\n")
-            self.hex_display.insert("end", HexEngine.get_hex_dump(target_file))
+        # Render Hex directly into the tab
+        if target_file:
+            current_txt.insert("end", f"[*] ARTIFACT HEX VIEW: {os.path.basename(target_file)}\n")
+            current_txt.insert("end", f"[*] SOURCE: {target_file}\n" + "="*80 + "\n")
+            current_txt.insert("end", HexEngine.get_hex_dump(target_file))
+        else:
+            current_txt.insert("0.0", f"[-] No binary artifact found for {active} context.")
 
     def trigger_analysis(self):
         tab = self.tabview.get()
@@ -193,34 +222,7 @@ class BrowsAR_App(ctk.CTk):
         elif tab == "Prefetch": self.analyze_prefetch_deep()
         elif tab == "Cookies" and self.current_browser_name == "Brave": self.analyze_brave_cookies()
 
-    # --- BRAVE COOKIE BYPASS ---
-    def analyze_brave_cookies(self):
-        messagebox.showinfo("Brows-AR", "Starting Headless Bypass. Brave will close temporarily.")
-        brave_exe = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
-        subprocess.run("taskkill /F /IM brave.exe /T", shell=True, capture_output=True)
-        time.sleep(2)
-
-        cmd = f'"{brave_exe}" --remote-debugging-port=9222 --user-data-dir="{self.current_browser_path}" --remote-allow-origins=* --headless --disable-gpu'
-        subprocess.Popen(cmd, shell=True)
-        time.sleep(5)
-
-        try:
-            resp = requests.get("http://localhost:9222/json")
-            ws_url = resp.json()[0]['webSocketDebuggerUrl']
-            ws = websocket.create_connection(ws_url)
-            ws.send(json.dumps({"id": 1, "method": "Network.getAllCookies"}))
-            result = json.loads(ws.recv())
-            cookies = result.get('result', {}).get('cookies', [])
-            ws.close()
-            subprocess.run("taskkill /F /IM brave.exe /T", shell=True, capture_output=True)
-            
-            data = [(c['domain'], c['name'], c['value'][:50]+"...") for c in cookies]
-            self.last_results, self.last_headers = data, ["Domain", "Name", "Value"]
-            AnalysisWindow("Brave v20 Cookies", self.last_headers, data)
-        except Exception as e:
-            messagebox.showerror("Bypass Error", f"Failed: {e}")
-
-    # --- SHARED ANALYSIS LOGIC ---
+    # --- FORENSIC METHODS ---
     def analyze_passwords(self):
         try: win32security.RevertToSelf()
         except: pass
@@ -332,10 +334,31 @@ class BrowsAR_App(ctk.CTk):
         self.last_results, self.last_headers = evidence, ["Artifact", "Forensic Data"]
         AnalysisWindow(f"{self.current_browser_name} Execution Evidence", self.last_headers, evidence)
 
+    def analyze_brave_cookies(self):
+        brave_exe = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
+        subprocess.run("taskkill /F /IM brave.exe /T", shell=True, capture_output=True)
+        time.sleep(2)
+        cmd = f'"{brave_exe}" --remote-debugging-port=9222 --user-data-dir="{self.current_browser_path}" --remote-allow-origins=* --headless --disable-gpu'
+        subprocess.Popen(cmd, shell=True)
+        time.sleep(5)
+        try:
+            resp = requests.get("http://localhost:9222/json")
+            ws_url = resp.json()[0]['webSocketDebuggerUrl']
+            ws = websocket.create_connection(ws_url)
+            ws.send(json.dumps({"id": 1, "method": "Network.getAllCookies"}))
+            result = json.loads(ws.recv())
+            cookies = result.get('result', {}).get('cookies', [])
+            ws.close()
+            subprocess.run("taskkill /F /IM brave.exe /T", shell=True, capture_output=True)
+            data = [(c['domain'], c['name'], c['value'][:50]+"...") for c in cookies]
+            self.last_results, self.last_headers = data, ["Domain", "Name", "Value"]
+            AnalysisWindow("Brave v20 Cookies", self.last_headers, data)
+        except: pass
+
     # --- REPORT EXPORTER ---
     def export_evidence(self):
         if not self.last_results:
-            messagebox.showwarning("Brows-AR", "No analysis data to export. Run analysis on a tab first!")
+            messagebox.showwarning("Brows-AR", "No analysis data to export.")
             return
         f_path = filedialog.asksaveasfilename(defaultextension=".html", filetypes=[("HTML Report", "*.html"), ("CSV Report", "*.csv")])
         if not f_path: return
@@ -350,7 +373,7 @@ class BrowsAR_App(ctk.CTk):
                     html += "<tr>" + "".join([f"<td style='padding:8px; border:1px solid #444;'>{val}</td>" for val in row]) + "</tr>"
                 html += "</table></body></html>"
                 with open(f_path, "w", encoding="utf-8") as f: f.write(html)
-            messagebox.showinfo("Brows-AR", f"Forensic Report Saved: {f_path}")
+            messagebox.showinfo("Brows-AR", f"Report Saved: {f_path}")
         except Exception as e: messagebox.showerror("Export Failed", f"Error: {e}")
 
 if __name__ == "__main__":
