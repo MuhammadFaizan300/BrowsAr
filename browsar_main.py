@@ -56,6 +56,25 @@ def impersonate_system():
     except:
         return False
 
+def get_prefetch_history(pf_path):
+    """Parses Windows 10/11 SCCA Prefetch files for the last 8 execution times."""
+    timestamps = []
+    try:
+        with open(pf_path, "rb") as f:
+            data = f.read()
+            # Windows 10/11 typically starts timestamp array at 0x80 or 0x98
+            # We look for the 'SCCA' header to verify
+            if data[0:4] == b'SCCA' or data[4:8] == b'SCCA':
+                # Read the last 8 timestamps (8 bytes each, FILETIME format)
+                for i in range(8):
+                    offset = 0x80 + (i * 8)
+                    raw_time = struct.unpack("<Q", data[offset:offset+8])[0]
+                    if raw_time > 0:
+                        dt = (datetime.datetime(1601, 1, 1) + datetime.timedelta(microseconds=raw_time/10))
+                        timestamps.append(dt.strftime('%Y-%m-%d %H:%M:%S'))
+    except: pass
+    return sorted(timestamps, reverse=True)
+
 # --- 2. PHYSICAL DISK MAPPER ---
 FSCTL_GET_RETRIEVAL_POINTERS = 0x00090073
 
@@ -220,6 +239,34 @@ class BrowsAR_App(ctk.CTk):
                                  fg_color="#1f538d" if self.physical_mode else "#333333")
         self.on_tab_changed()
 
+    def get_tor_network_artifacts(self, tor_folder):
+        """Scans Tor config and state files for bridge usage and network volume."""
+        info = []
+        # 1. Bridge Detection
+        torrc = os.path.join(tor_folder, "tor-torrc")
+        if os.path.exists(torrc):
+            with open(torrc, "r") as f:
+                content = f.read()
+                if "UseBridges 1" in content:
+                    info.append(("Bridge Status", "ENABLED (Stealth Mode Active)"))
+                    if "snowflake" in content.lower(): info.append(("Bridge Type", "Snowflake (Bypass govt firewalls)"))
+                else:
+                    info.append(("Bridge Status", "Disabled (Direct Connection)"))
+
+        # 2. Network Volume (Quantification)
+        # Tor often keeps a 'state' file in its DataDirectory
+        data_dir = os.path.join(os.environ['LOCALAPPDATA'], r"BraveSoftware\Brave-Browser\User Data\tor\data")
+        state_file = os.path.join(data_dir, "state")
+        if os.path.exists(state_file):
+            with open(state_file, "r") as f:
+                for line in f:
+                    if "TotalWriteBytes" in line:
+                        bytes_val = int(line.split()[1])
+                        info.append(("Total Uploaded", f"{bytes_val / (1024*1024):.2f} MB"))
+                    if "TotalReadBytes" in line:
+                        bytes_val = int(line.split()[1])
+                        info.append(("Total Downloaded", f"{bytes_val / (1024*1024):.2f} MB"))
+        return info
     def setup_hex_tab(self, t):
         container = ctk.CTkFrame(self.tabview.tab(t), fg_color="transparent")
         container.pack(fill="both", expand=True)
@@ -372,44 +419,45 @@ class BrowsAR_App(ctk.CTk):
         except Exception as e:
             messagebox.showerror("Forensic Error", str(e))
     def analyze_tor_private(self):
-        """Specialized Brave-Tor forensic scan."""
+        """Master Tor Forensic Engine: Registry, Prefetch, Config, and Network."""
         res = []
-        # 1. Component Check (Proves feature was enabled)
+
         comp = os.path.join(self.current_browser_path, "cpoalefficncklhjfpglfiplenlpccdb")
         if os.path.exists(comp):
             m_time = datetime.datetime.fromtimestamp(os.path.getmtime(comp))
             res.append(("Tor Plugin Status", f"INSTALLED/INITIALIZED: {m_time}"))
-        
-        # 2. Registry Execution Detection (UserAssist decoding)
+            
+        # 1. Timeline Analysis (Prefetch)
+        pf_dir = r"C:\Windows\Prefetch"
+        if os.path.exists(pf_dir):
+            for f in os.listdir(pf_dir):
+                if "TOR" in f.upper() and f.endswith(".pf"):
+                    times = get_prefetch_history(os.path.join(pf_dir, f))
+                    for i, t in enumerate(times):
+                        res.append((f"Execution Time {i+1}", t))
+
+        # 2. Bridge & Volume Extraction
+        tor_comp = os.path.join(self.current_browser_path, "cpoalefficncklhjfpglfiplenlpccdb")
+        if os.path.exists(tor_comp):
+            # Use os.walk to find the version folder (e.g. 1.0.42)
+            for root, dirs, files in os.walk(tor_comp):
+                if "tor-torrc" in files:
+                    net_data = self.get_tor_network_artifacts(root)
+                    res.extend(net_data)
+
+        # 3. Registry History (Keep original logic)
         try:
             ua_path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist\{CEBFF5CD-ACE2-4F4F-9178-9926F41749EA}\Count"
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, ua_path) as key:
                 for i in range(winreg.QueryInfoKey(key)[1]):
-                    name, data, _ = winreg.EnumValue(key, i)
-                    decoded = rot13(name)
+                    n, d, _ = winreg.EnumValue(key, i)
+                    decoded = rot13(n)
                     if "tor" in decoded.lower():
-                        runs = struct.unpack("<I", data[4:8])[0]
-                        res.append(("Registry Execution", f"{decoded} | Runs: {runs}"))
+                        res.append(("Registry Record", f"{decoded} (Runs: {struct.unpack('<I', d[4:8])[0]})"))
         except: pass
 
-        # 3. Privacy Leak Scan (Onion site records in main profile)
-        prefs = os.path.join(self.current_browser_path, "Default", "Preferences")
-        if os.path.exists(prefs):
-            try:
-                shutil.copyfile(prefs, "p_tmp")
-                with open("p_tmp", "r", encoding="utf-8") as f:
-                    data = json.load(f).get("profile", {}).get("content_settings", {}).get("exceptions", {})
-                    if isinstance(data, dict):
-                        for setting_type, value in data.items():
-                            if isinstance(value, dict):
-                                for site in value:
-                                    if ".onion" in site:
-                                        res.append(("Onion Site Record", f"{site} (Type: {setting_type})"))
-                os.remove("p_tmp")
-            except: pass
-            
-        self.last_results, self.last_headers = res, ["Artifact", "Forensic Detail"]
-        AnalysisWindow("Brave Tor Forensic Investigation", self.last_headers, res)
+        self.last_results, self.last_headers = res, ["Forensic Artifact", "Extracted Evidence"]
+        AnalysisWindow("Brave TOR - Full Forensic Profile", self.last_headers, res)
 
     def analyze_autofill(self):
         path = self.get_artifact_path("Autofill")
