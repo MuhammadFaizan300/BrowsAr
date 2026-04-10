@@ -29,6 +29,14 @@ def is_admin():
         return ctypes.windll.shell32.IsUserAnAdmin()
     except:
         return False
+def rot13(text):
+    """Decodes Windows UserAssist scrambled names for Tor detection."""
+    res = ""
+    for char in text:
+        if 'a' <= char <= 'z': res += chr((ord(char) - ord('a') + 13) % 26 + ord('a'))
+        elif 'A' <= char <= 'Z': res += chr((ord(char) - ord('A') + 13) % 26 + ord('A'))
+        else: res += char
+    return res
 
 def impersonate_system():
     try:
@@ -195,6 +203,7 @@ class BrowsAR_App(ctk.CTk):
         tabs = ["Hex Explorer", "Passwords", "History", "Downloads", "Bookmarks", "Autofill", "Registry", "Prefetch"]
         if name == "Brave":
             tabs.append("Cookies")
+            tabs.append("TOR-Private")
         
         for t in tabs: 
             self.tabview.add(t)
@@ -303,14 +312,31 @@ class BrowsAR_App(ctk.CTk):
         self.on_tab_changed()
 
     def get_artifact_path(self, active):
-        t = {"Passwords": "Login Data", "History": "History", "Downloads": "History", 
-             "Bookmarks": "Bookmarks", "Autofill": "Web Data", "Cookies": "Cookies"}.get(active, "Local State")
-        root_check = os.path.join(self.current_browser_path, t)
-        if os.path.exists(root_check) and not os.path.isdir(root_check):
-            return root_check
+        # --- 1. TOR-SPECIFIC CHECK (MUST BE FIRST) ---
+        # This prevents the "Local State" default from highjacking the path
+        if active == "TOR-Private" and self.current_browser_name == "Brave":
+            tor_comp_root = os.path.join(self.current_browser_path, "cpoalefficncklhjfpglfiplenlpccdb")
+            if os.path.exists(tor_comp_root):
+                # os.walk handles the version folder (e.g., 1.0.42) automatically
+                for root, dirs, files in os.walk(tor_comp_root):
+                    if "tor-torrc" in files:
+                        return os.path.join(root, "tor-torrc")
+                    elif "tor.exe" in files:
+                        return os.path.join(root, "tor.exe")
+            return None # Return None if Tor isn't installed
+
+        # --- 2. DEFINE OTHER TARGET NAMES ---
+        t_name = {"Passwords": "Login Data", "History": "History", "Downloads": "History", 
+                  "Bookmarks": "Bookmarks", "Autofill": "Web Data", "Cookies": "Cookies"}.get(active, "Local State")
+        
+        # --- 3. PRIORITY ROOT CHECK (Maintains WinHex accuracy for Chrome/Edge) ---
+        root_path = os.path.join(self.current_browser_path, t_name)
+        if os.path.exists(root_path) and not os.path.isdir(root_path): 
+            return root_path
+
+        # --- 4. STANDARD RECURSIVE FALLBACK ---
         for r, d, f in os.walk(self.current_browser_path):
-            if t in f:
-                return os.path.join(r, t)
+            if t_name in f: return os.path.join(r, t_name)
         return None
 
     def trigger_analysis(self):
@@ -323,6 +349,7 @@ class BrowsAR_App(ctk.CTk):
         elif tab == "Registry": self.analyze_registry_deep()
         elif tab == "Prefetch": self.analyze_prefetch_deep()
         elif tab == "Cookies": self.analyze_brave_cookies()
+        elif tab == "TOR-Private": self.analyze_tor_private()
 
     # --- 6. FORENSIC ANALYZERS (BOOKMARKS & AUTOFILL) ---
     def analyze_bookmarks(self):
@@ -344,6 +371,45 @@ class BrowsAR_App(ctk.CTk):
             AnalysisWindow(f"{self.current_browser_name} Bookmarks", self.last_headers, res)
         except Exception as e:
             messagebox.showerror("Forensic Error", str(e))
+    def analyze_tor_private(self):
+        """Specialized Brave-Tor forensic scan."""
+        res = []
+        # 1. Component Check (Proves feature was enabled)
+        comp = os.path.join(self.current_browser_path, "cpoalefficncklhjfpglfiplenlpccdb")
+        if os.path.exists(comp):
+            m_time = datetime.datetime.fromtimestamp(os.path.getmtime(comp))
+            res.append(("Tor Plugin Status", f"INSTALLED/INITIALIZED: {m_time}"))
+        
+        # 2. Registry Execution Detection (UserAssist decoding)
+        try:
+            ua_path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist\{CEBFF5CD-ACE2-4F4F-9178-9926F41749EA}\Count"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, ua_path) as key:
+                for i in range(winreg.QueryInfoKey(key)[1]):
+                    name, data, _ = winreg.EnumValue(key, i)
+                    decoded = rot13(name)
+                    if "tor" in decoded.lower():
+                        runs = struct.unpack("<I", data[4:8])[0]
+                        res.append(("Registry Execution", f"{decoded} | Runs: {runs}"))
+        except: pass
+
+        # 3. Privacy Leak Scan (Onion site records in main profile)
+        prefs = os.path.join(self.current_browser_path, "Default", "Preferences")
+        if os.path.exists(prefs):
+            try:
+                shutil.copyfile(prefs, "p_tmp")
+                with open("p_tmp", "r", encoding="utf-8") as f:
+                    data = json.load(f).get("profile", {}).get("content_settings", {}).get("exceptions", {})
+                    if isinstance(data, dict):
+                        for setting_type, value in data.items():
+                            if isinstance(value, dict):
+                                for site in value:
+                                    if ".onion" in site:
+                                        res.append(("Onion Site Record", f"{site} (Type: {setting_type})"))
+                os.remove("p_tmp")
+            except: pass
+            
+        self.last_results, self.last_headers = res, ["Artifact", "Forensic Detail"]
+        AnalysisWindow("Brave Tor Forensic Investigation", self.last_headers, res)
 
     def analyze_autofill(self):
         path = self.get_artifact_path("Autofill")
