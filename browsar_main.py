@@ -223,6 +223,8 @@ class BrowsAR_App(ctk.CTk):
         if name == "Brave":
             tabs.append("Cookies")
             tabs.append("TOR-Private")
+        elif name in ("Chrome", "Edge"):
+            tabs.append("Cookies")
         
         for t in tabs: 
             self.tabview.add(t)
@@ -395,7 +397,10 @@ class BrowsAR_App(ctk.CTk):
         elif tab == "Autofill": self.analyze_autofill()
         elif tab == "Registry": self.analyze_registry_deep()
         elif tab == "Prefetch": self.analyze_prefetch_deep()
-        elif tab == "Cookies": self.analyze_brave_cookies()
+        elif tab == "Cookies":
+            if self.current_browser_name == "Brave": self.analyze_brave_cookies()
+            elif self.current_browser_name == "Chrome": self.analyze_chrome_cookies()
+            elif self.current_browser_name == "Edge": self.analyze_edge_cookies()
         elif tab == "TOR-Private": self.analyze_tor_private()
 
     # --- 6. FORENSIC ANALYZERS (BOOKMARKS & AUTOFILL) ---
@@ -588,6 +593,35 @@ class BrowsAR_App(ctk.CTk):
         self.last_results, self.last_headers = res, ["Artifact", "Data"]
         AnalysisWindow("Prefetch", self.last_headers, res)
 
+    def _cdp_extract_cookies(self, browser_name, exe_path, process_name, user_data_dir):
+        """Generic CDP cookie extractor. Launches the browser headless, pulls all cookies via
+        Network.getAllCookies, kills the browser, and returns the result rows."""
+        messagebox.showinfo("Brows-AR", f"Starting Headless Bypass. {browser_name} will close temporarily.")
+        subprocess.run(f"taskkill /F /IM {process_name} /T", shell=True, capture_output=True)
+        time.sleep(2)
+        cmd = f'"{exe_path}" --remote-debugging-port=9222 --user-data-dir="{user_data_dir}" --remote-allow-origins=* --headless --disable-gpu --no-sandbox'
+        subprocess.Popen(cmd, shell=True)
+        time.sleep(5)
+        try:
+            resp = requests.get("http://localhost:9222/json", timeout=10)
+            targets = resp.json()
+            if not targets:
+                messagebox.showerror("CDP Error", "No debuggable targets found.")
+                return
+            ws_url = targets[0]['webSocketDebuggerUrl']
+            ws = websocket.create_connection(ws_url, timeout=10)
+            ws.send(json.dumps({"id": 1, "method": "Network.getAllCookies"}))
+            result = json.loads(ws.recv())
+            cookies = result.get('result', {}).get('cookies', [])
+            ws.close()
+            subprocess.run(f"taskkill /F /IM {process_name} /T", shell=True, capture_output=True)
+            res = [(c['domain'], c['name'], c['value'][:50] + ("..." if len(c['value']) > 50 else "")) for c in cookies]
+            self.last_results, self.last_headers = res, ["Domain", "Name", "Value"]
+            AnalysisWindow(f"{browser_name} Cookies (CDP Bypass)", self.last_headers, res)
+        except Exception as e:
+            subprocess.run(f"taskkill /F /IM {process_name} /T", shell=True, capture_output=True)
+            messagebox.showerror("Bypass Failed", f"Error: {e}")
+
     def analyze_brave_cookies(self):
         messagebox.showinfo("Brows-AR", "Starting Headless Bypass. Brave will close temporarily.")
         brave_exe = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
@@ -609,6 +643,22 @@ class BrowsAR_App(ctk.CTk):
             self.last_results, self.last_headers = res, ["Domain", "Name", "Value"]
             AnalysisWindow("Brave Cookies (v20 Bypass)", self.last_headers, res)
         except Exception as e: messagebox.showerror("Bypass Failed", f"Error: {e}")
+
+    def analyze_chrome_cookies(self):
+        _chrome_candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ]
+        chrome_exe = next((p for p in _chrome_candidates if os.path.exists(p)), _chrome_candidates[0])
+        self._cdp_extract_cookies("Chrome", chrome_exe, "chrome.exe", self.current_browser_path)
+
+    def analyze_edge_cookies(self):
+        _edge_candidates = [
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ]
+        edge_exe = next((p for p in _edge_candidates if os.path.exists(p)), _edge_candidates[0])
+        self._cdp_extract_cookies("Edge", edge_exe, "msedge.exe", self.current_browser_path)
 
     def export_evidence(self):
         if not self.last_results: return
