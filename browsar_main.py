@@ -23,7 +23,7 @@ import win32con
 import psutil
 import win32file
 
-# --- 1. SYSTEM PRIVILEGE LOGIC ---
+# --- 1. SYSTEM PRIVILEGE LOGIC ----
 def is_admin():
     try:
         return ctypes.windll.shell32.IsUserAnAdmin()
