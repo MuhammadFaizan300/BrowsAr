@@ -15,6 +15,7 @@ import websocket
 import csv
 import customtkinter as ctk
 from tkinter import messagebox, ttk, filedialog
+import tkinter as _tk
 from Cryptodome.Cipher import AES
 import win32crypt
 import win32security
@@ -184,86 +185,302 @@ class HexEngine:
         except:
             return "[-] Read Error: Access Denied."
 
+# colour tokens ─ one place to change the whole palette
+_C_DARK = {
+    "bg":         "#0d0d0d",  "surface":    "#141414",  "surface2":   "#1c1c1c",
+    "border":     "#2a2a2a",  "accent":     "#4f8ef7",  "accent_dim": "#1e3a6e",
+    "danger":     "#e05252",  "success":    "#3dba7a",  "warning":    "#e0a030",
+    "text":       "#e8e8e8",  "text_dim":   "#888888",  "text_faint": "#444444",
+    "mono":       "Consolas", "sans":       "Segoe UI",
+}
+_C_LIGHT = {
+    "bg":         "#f0f2f5",  "surface":    "#ffffff",  "surface2":   "#f5f7fa",
+    "border":     "#dde1e7",  "accent":     "#4272d4",  "accent_dim": "#cfe0ff",
+    "danger":     "#c53030",  "success":    "#1e7e3e",  "warning":    "#a06000",
+    "text":       "#1a1a2e",  "text_dim":   "#4a5568",  "text_faint": "#a0aec0",
+    "mono":       "Consolas", "sans":       "Segoe UI",
+}
+# _C is the live palette – mutated in-place on theme toggle
+_C = dict(_C_DARK)
+
+_BROWSER_ACCENT = {
+    "Brave":       "#fb542b",
+    "Chrome":      "#4285f4",
+    "Edge":        "#0078d4",
+    "Tor Browser": "#7d4698",
+}
+
 # --- 4. ANALYSIS POPUP WINDOW ---
 class AnalysisWindow(ctk.CTkToplevel):
     def __init__(self, title, columns, data):
         super().__init__()
         self.title(title)
-        self.geometry("1200x700")
+        self.geometry("1280x740")
+        self.configure(fg_color=_C["bg"])
         self.attributes('-topmost', True)
-        
+        self.resizable(True, True)
+
+        # ── header bar ──────────────────────────────────────────────────
+        hdr = ctk.CTkFrame(self, fg_color=_C["surface"], corner_radius=0, height=52)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        ctk.CTkLabel(hdr, text=title, font=(_C["sans"], 14, "bold"),
+                     text_color=_C["text"]).pack(side="left", padx=20, pady=14)
+        ctk.CTkLabel(hdr, text=f"{len(data)} records",
+                     font=(_C["sans"], 12), text_color=_C["text_dim"]).pack(side="right", padx=20)
+
+        # ── treeview container ──────────────────────────────────────────
+        frame = ctk.CTkFrame(self, fg_color=_C["surface2"], corner_radius=0)
+        frame.pack(fill="both", expand=True, padx=0, pady=0)
+
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure("Treeview", background="#1a1a1a", foreground="white", fieldbackground="#1a1a1a", borderwidth=0)
-        style.configure("Treeview.Heading", background="#333333", foreground="white", relief="flat")
-        
-        self.tree = ttk.Treeview(self, columns=columns, show='headings')
+        style.configure("AR.Treeview",
+                        background=_C["surface2"],
+                        foreground=_C["text"],
+                        fieldbackground=_C["surface2"],
+                        rowheight=26,
+                        borderwidth=0,
+                        font=(_C["mono"], 11))
+        style.configure("AR.Treeview.Heading",
+                        background=_C["surface"],
+                        foreground=_C["text_dim"],
+                        relief="flat",
+                        font=(_C["sans"], 10, "bold"))
+        style.map("AR.Treeview",
+                  background=[("selected", _C["accent_dim"])],
+                  foreground=[("selected", _C["text"])])
+        style.layout("AR.Treeview", [("AR.Treeview.treearea", {"sticky": "nswe"})])
+
+        vsb = ttk.Scrollbar(frame, orient="vertical")
+        hsb = ttk.Scrollbar(frame, orient="horizontal")
+        self.tree = ttk.Treeview(frame, columns=columns, show="headings",
+                                 style="AR.Treeview",
+                                 yscrollcommand=vsb.set,
+                                 xscrollcommand=hsb.set)
+        vsb.configure(command=self.tree.yview)
+        hsb.configure(command=self.tree.xview)
+
         for col in columns:
-            self.tree.heading(col, text=col.upper())
-            self.tree.column(col, width=200, anchor="w")
-        
-        for row in data:
-            self.tree.insert("", "end", values=row)
-            
-        self.tree.pack(fill="both", expand=True, padx=10, pady=10)
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=220, anchor="w", minwidth=80)
+
+        # alternating row colours
+        self.tree.tag_configure("odd",  background="#191919")
+        self.tree.tag_configure("even", background=_C["surface2"])
+        for i, row in enumerate(data):
+            self.tree.insert("", "end", values=row, tags=("odd" if i % 2 else "even",))
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        frame.grid_rowconfigure(0, weight=1)
+        frame.grid_columnconfigure(0, weight=1)
 
 # --- 5. MAIN DASHBOARD ---
 class BrowsAR_App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Brows-AR | Ultimate Forensic Suite")
-        self.geometry("1450x900")
+        self.title("Brows-AR  |  Browser Forensic Suite")
+        self.geometry("1520x920")
+        self.minsize(1100, 700)
         ctk.set_appearance_mode("dark")
-        
+        self.configure(fg_color=_C["bg"])
+
         self.current_browser_path = ""
         self.current_browser_name = ""
-        self.physical_mode = False 
+        self.physical_mode = False
         self.tab_offsets = {}
         self.page_size = 4096
         self.displays = {}
         self.last_results = []
         self.last_headers = []
+        self._sidebar_btns = {}
+        self._active_theme = "dark"
 
-        self.sidebar = ctk.CTkFrame(self, width=240, corner_radius=0)
-        self.sidebar.pack(side="left", fill="y")
-        ctk.CTkLabel(self.sidebar, text="Brows-AR", font=("Consolas", 28, "bold")).pack(padx=20, pady=40)
+        # ── sidebar ─────────────────────────────────────────────────────
+        self._build_sidebar()
 
-        self.browser_paths = {
-            "Brave": os.path.join(os.environ['LOCALAPPDATA'], r"BraveSoftware\Brave-Browser\User Data"),
-            "Chrome": os.path.join(os.environ['LOCALAPPDATA'], r"Google\Chrome\User Data"),
-            "Edge": os.path.join(os.environ['LOCALAPPDATA'], r"Microsoft\Edge\User Data")
-        }
-        _tor_root = find_tor_browser()
-        if _tor_root:
-            self.browser_paths["Tor Browser"] = _tor_root
+        # ── main canvas ─────────────────────────────────────────────────
+        self.main_view = ctk.CTkFrame(self, corner_radius=0, fg_color=_C["bg"])
+        self.main_view.pack(side="right", fill="both", expand=True)
+        self._draw_welcome()
 
-        for name in self.browser_paths:
-            if os.path.exists(self.browser_paths[name]):
-                ctk.CTkButton(self.sidebar, text=f"Investigate {name}", font=("Consolas", 13),
-                              command=lambda n=name, p=self.browser_paths[name]: self.load_browser_cockpit(n, p)).pack(pady=10, padx=20)
+    def _draw_welcome(self):
+        for w in self.main_view.winfo_children():
+            w.destroy()
+        mid = ctk.CTkFrame(self.main_view, fg_color="transparent")
+        mid.place(relx=0.5, rely=0.5, anchor="center")
+        ctk.CTkLabel(mid, text="Brows-AR",
+                     font=(_C["sans"], 48, "bold"),
+                     text_color=_C["text_faint"]).pack()
+        ctk.CTkLabel(mid, text="Select a target browser from the sidebar to begin.",
+                     font=(_C["sans"], 14),
+                     text_color=_C["text_faint"]).pack(pady=8)
 
-        self.main_view = ctk.CTkFrame(self, corner_radius=15, fg_color="#121212")
-        self.main_view.pack(side="right", fill="both", expand=True, padx=20, pady=20)
-        ctk.CTkLabel(self.main_view, text="[*] SYSTEM TRIAGE READY", font=("Consolas", 16)).place(relx=0.5, rely=0.5, anchor="center")
+    # ── sidebar builder (called on init and theme toggle) ──────────────
+    def _build_sidebar(self):
+        self.sidebar = ctk.CTkFrame(self, width=220, corner_radius=0,
+                                    fg_color=_C["surface"])
+        if hasattr(self, "main_view"):
+            self.sidebar.pack(side="left", fill="y", before=self.main_view)
+        else:
+            self.sidebar.pack(side="left", fill="y")
+        self.sidebar.pack_propagate(False)
+
+        # logo block
+        logo_frame = ctk.CTkFrame(self.sidebar, fg_color=_C["surface"], corner_radius=0)
+        logo_frame.pack(fill="x", pady=(28, 20), padx=20)
+        ctk.CTkLabel(logo_frame, text="Brows-AR",
+                     font=(_C["sans"], 22, "bold"),
+                     text_color=_C["text"]).pack(anchor="w")
+        ctk.CTkLabel(logo_frame, text="Browser Forensic Suite",
+                     font=(_C["sans"], 10),
+                     text_color=_C["text_dim"]).pack(anchor="w")
+
+        # divider
+        ctk.CTkFrame(self.sidebar, height=1, fg_color=_C["border"],
+                     corner_radius=0).pack(fill="x", padx=16, pady=(0, 16))
+
+        ctk.CTkLabel(self.sidebar, text="TARGETS",
+                     font=(_C["sans"], 9, "bold"),
+                     text_color=_C["text_faint"]).pack(anchor="w", padx=20, pady=(0, 8))
+
+        if not hasattr(self, "browser_paths"):
+            self.browser_paths = {
+                "Brave":  os.path.join(os.environ['LOCALAPPDATA'], r"BraveSoftware\Brave-Browser\User Data"),
+                "Chrome": os.path.join(os.environ['LOCALAPPDATA'], r"Google\Chrome\User Data"),
+                "Edge":   os.path.join(os.environ['LOCALAPPDATA'], r"Microsoft\Edge\User Data"),
+            }
+            _tor_root = find_tor_browser()
+            if _tor_root:
+                self.browser_paths["Tor Browser"] = _tor_root
+
+        _icons = {"Brave": "🦁", "Chrome": "⬡", "Edge": "◈", "Tor Browser": "⬤"}
+        self._sidebar_btns = {}
+        for name, bpath in self.browser_paths.items():
+            exists = os.path.exists(bpath)
+            icon   = _icons.get(name, "▸")
+            color  = _BROWSER_ACCENT.get(name, _C["accent"])
+            is_active = (name == self.current_browser_name)
+            btn = ctk.CTkButton(
+                self.sidebar,
+                text=f"  {icon}  {name}",
+                anchor="w",
+                height=40,
+                corner_radius=8,
+                font=(_C["sans"], 13),
+                fg_color=color if is_active else "transparent",
+                hover_color=_C["surface2"],
+                text_color=_C["text"] if exists else _C["text_faint"],
+                state="normal" if exists else "disabled",
+                command=lambda n=name, p=bpath: self.load_browser_cockpit(n, p),
+            )
+            btn.pack(fill="x", padx=12, pady=3)
+            self._sidebar_btns[name] = (btn, color)
+
+        # ── theme toggle ────────────────────────────────────────────────
+        ctk.CTkFrame(self.sidebar, height=1, fg_color=_C["border"],
+                     corner_radius=0).pack(side="bottom", fill="x", padx=16)
+        _theme_icon = "☀  Light Mode" if self._active_theme == "dark" else "🌙  Dark Mode"
+        ctk.CTkButton(
+            self.sidebar,
+            text=_theme_icon,
+            height=34,
+            corner_radius=8,
+            font=(_C["sans"], 12),
+            fg_color=_C["surface2"],
+            hover_color=_C["border"],
+            text_color=_C["text_dim"],
+            command=self._toggle_theme,
+        ).pack(side="bottom", fill="x", padx=12, pady=(4, 10))
+
+        ctk.CTkLabel(self.sidebar, text="v2.0  •  forensic mode",
+                     font=(_C["sans"], 9),
+                     text_color=_C["text_faint"]).pack(side="bottom", pady=(8, 4))
+
+    def _toggle_theme(self):
+        self._active_theme = "light" if self._active_theme == "dark" else "dark"
+        _C.update(_C_LIGHT if self._active_theme == "light" else _C_DARK)
+        ctk.set_appearance_mode("light" if self._active_theme == "light" else "dark")
+        # defer rebuild so the button callback finishes before we destroy its parent
+        self.after(10, self._apply_theme_rebuild)
+
+    def _apply_theme_rebuild(self):
+        self.withdraw()               # hide window to prevent visible flicker
+        self.sidebar.destroy()
+        self._build_sidebar()
+        self.configure(fg_color=_C["bg"])
+        self.main_view.configure(fg_color=_C["bg"])
+        if self.current_browser_name:
+            self.load_browser_cockpit(self.current_browser_name, self.current_browser_path)
+        else:
+            self._draw_welcome()
+        self.update_idletasks()        # flush all layout before revealing
+        self.deiconify()               # show fully-rebuilt window at once
 
     def load_browser_cockpit(self, name, path):
         self.current_browser_name, self.current_browser_path = name, path
+
+        # highlight active sidebar button
+        for bname, (btn, color) in self._sidebar_btns.items():
+            btn.configure(fg_color=color if bname == name else "transparent")
+
         for widget in self.main_view.winfo_children():
             widget.destroy()
-        
-        control_frame = ctk.CTkFrame(self.main_view, fg_color="transparent")
-        control_frame.pack(fill="x", padx=20, pady=15)
-        
-        ctk.CTkLabel(control_frame, text=f"TARGET: {name.upper()}", font=("Consolas", 18, "bold"), text_color="#1f538d").pack(side="left")
-        ctk.CTkButton(control_frame, text="📥 EXPORT", fg_color="#27ae60", command=self.export_evidence).pack(side="right", padx=10)
-        ctk.CTkButton(control_frame, text="⚡ RUN ANALYSIS", fg_color="#d35400", command=self.trigger_analysis).pack(side="right", padx=10)
-        
-        self.toggle_btn = ctk.CTkButton(control_frame, text="MODE: RELATIVE", fg_color="#333333", command=self.toggle_address_mode)
-        self.toggle_btn.pack(side="right", padx=10)
 
-        self.tabview = ctk.CTkTabview(self.main_view, command=self.on_tab_changed)
-        self.tabview.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-        
+        accent = _BROWSER_ACCENT.get(name, _C["accent"])
+
+        # ── top bar ─────────────────────────────────────────────────────
+        topbar = ctk.CTkFrame(self.main_view, fg_color=_C["surface"],
+                              corner_radius=0, height=60)
+        topbar.pack(fill="x")
+        topbar.pack_propagate(False)
+
+        # coloured left accent strip
+        ctk.CTkFrame(topbar, width=4, corner_radius=0,
+                     fg_color=accent).pack(side="left", fill="y")
+
+        ctk.CTkLabel(topbar, text=name,
+                     font=(_C["sans"], 18, "bold"),
+                     text_color=_C["text"]).pack(side="left", padx=18, pady=16)
+        ctk.CTkLabel(topbar, text=path,
+                     font=(_C["mono"], 10),
+                     text_color=_C["text_dim"]).pack(side="left", padx=0)
+
+        # right-side action buttons
+        btn_frame = ctk.CTkFrame(topbar, fg_color="transparent")
+        btn_frame.pack(side="right", padx=16)
+
+        ctk.CTkButton(btn_frame, text="⤓  Export", width=100, height=32,
+                      corner_radius=6,
+                      font=(_C["sans"], 12),
+                      fg_color=_C["surface2"], hover_color=_C["border"],
+                      text_color=_C["text"],
+                      command=self.export_evidence).pack(side="right", padx=4)
+
+        ctk.CTkButton(btn_frame, text="▶  Run Analysis", width=140, height=32,
+                      corner_radius=6,
+                      font=(_C["sans"], 12, "bold"),
+                      fg_color=accent, hover_color=accent,
+                      text_color="white",
+                      command=self.trigger_analysis).pack(side="right", padx=4)
+
+        self.toggle_btn = ctk.CTkButton(
+            btn_frame, text="▦  Relative", width=110, height=32,
+            corner_radius=6,
+            font=(_C["sans"], 12),
+            fg_color=_C["surface2"], hover_color=_C["border"],
+            text_color=_C["text_dim"],
+            command=self.toggle_address_mode)
+        self.toggle_btn.pack(side="right", padx=4)
+
+        # ── custom tab bar ───────────────────────────────────────────────
+        self._tab_frames     = {}
+        self._tab_btns       = {}
+        self._tab_indicators = {}
+        self._active_tab     = None
+
         tabs = ["Hex Explorer", "Passwords", "History", "Downloads", "Bookmarks", "Autofill", "Registry", "Prefetch"]
         if name == "Brave":
             tabs.append("Cookies")
@@ -273,20 +490,136 @@ class BrowsAR_App(ctk.CTk):
         elif name == "Tor Browser":
             tabs = ["Hex Explorer", "Passwords", "History", "Downloads", "Bookmarks",
                     "Autofill", "Registry", "Prefetch", "Cookies", "Tor State"]
-        
-        for t in tabs: 
-            self.tabview.add(t)
+
+        # ── tab strip (scrollable) ───────────────────────────────────
+        _strip_bg = _C["surface"]
+        _tab_outer = ctk.CTkFrame(self.main_view, fg_color=_strip_bg,
+                                  corner_radius=0, height=44)
+        _tab_outer.pack(fill="x")
+        _tab_outer.pack_propagate(False)
+
+        # ◀ / ▶ scroll arrows pinned at the right edge
+        _arrows = ctk.CTkFrame(_tab_outer, fg_color=_strip_bg, corner_radius=0)
+        _arrows.pack(side="right", fill="y")
+        # placeholder – wired to _tab_canvas after it's created
+        _lbtn = ctk.CTkButton(_arrows, text="◀", width=28, height=44,
+                              corner_radius=0,
+                              font=(_C["sans"], 11),
+                              fg_color="transparent",
+                              hover_color=_C["surface2"],
+                              text_color=_C["text_dim"])
+        _lbtn.pack(side="left")
+        _rbtn = ctk.CTkButton(_arrows, text="▶", width=28, height=44,
+                              corner_radius=0,
+                              font=(_C["sans"], 11),
+                              fg_color="transparent",
+                              hover_color=_C["surface2"],
+                              text_color=_C["text_dim"])
+        _rbtn.pack(side="left")
+
+        _tab_canvas = _tk.Canvas(_tab_outer, height=44, bg=_strip_bg,
+                                 highlightthickness=0, bd=0)
+        _tab_canvas.pack(side="left", fill="both", expand=True)
+
+        # wire arrow buttons now that canvas exists
+        _lbtn.configure(command=lambda: _tab_canvas.xview_scroll(-3, "units"))
+        _rbtn.configure(command=lambda: _tab_canvas.xview_scroll( 3, "units"))
+
+        _tab_inner = _tk.Frame(_tab_canvas, bg=_strip_bg)
+        _tab_canvas.create_window(0, 0, anchor="nw", window=_tab_inner)
+
+        def _update_sr(e):
+            _tab_canvas.configure(scrollregion=_tab_canvas.bbox("all"))
+        _tab_inner.bind("<Configure>", _update_sr)
+
+        def _wheel_h(e):
+            _tab_canvas.xview_scroll(int(-1 * (e.delta / 120)), "units")
+        _tab_canvas.bind("<MouseWheel>", _wheel_h)
+        _tab_inner.bind("<MouseWheel>", _wheel_h)
+
+        # thin separator below strip
+        ctk.CTkFrame(self.main_view, height=1, fg_color=_C["border"],
+                     corner_radius=0).pack(fill="x")
+
+        # ── content area ────────────────────────────────────────────────
+        self._tab_content_area = ctk.CTkFrame(self.main_view, fg_color=_C["bg"],
+                                              corner_radius=0)
+        self._tab_content_area.pack(fill="both", expand=True)
+
+        # build ALL content frames first (none visible yet)
+        for t in tabs:
+            frame = ctk.CTkFrame(self._tab_content_area, fg_color=_C["bg"], corner_radius=0)
+            self._tab_frames[t] = frame
             self.tab_offsets[t] = 0
             if t == "Registry":
                 self.setup_registry_explorer(t)
             else:
                 self.setup_hex_tab(t)
-        self.on_tab_changed()
+
+        # now render tab buttons (no layout work triggered above)
+        _tab_icons = {
+            "Hex Explorer": "⬡",
+            "Passwords":    "🔑",
+            "History":      "🕐",
+            "Downloads":    "⬇",
+            "Bookmarks":    "★",
+            "Autofill":     "✏",
+            "Registry":     "⚙",
+            "Prefetch":     "⚡",
+            "Cookies":      "◈",
+            "TOR-Private":  "🧅",
+            "Tor State":    "⬤",
+        }
+        for t in tabs:
+            label = f" {_tab_icons.get(t, '')}  {t} "
+            wrap = ctk.CTkFrame(_tab_inner, fg_color=_strip_bg, corner_radius=0)
+            wrap.pack(side="left", fill="y")
+
+            btn = ctk.CTkButton(
+                wrap, text=label,
+                height=38, corner_radius=0,
+                font=(_C["sans"], 12),
+                fg_color="transparent",
+                hover_color=_C["surface2"],
+                text_color=_C["text_dim"],
+                border_width=0,
+                command=lambda _t=t: self._switch_tab(_t),
+            )
+            btn.pack(fill="x", padx=0)
+
+            ind = ctk.CTkFrame(wrap, height=2, corner_radius=0, fg_color="transparent")
+            ind.pack(fill="x")
+
+            # propagate scroll to canvas
+            wrap.bind("<MouseWheel>", _wheel_h)
+            btn.bind("<MouseWheel>", _wheel_h)
+
+            self._tab_btns[t]       = btn
+            self._tab_indicators[t] = ind
+
+        # show first tab (no animation, instant)
+        self._switch_tab(tabs[0])
 
     def toggle_address_mode(self):
         self.physical_mode = not self.physical_mode
-        self.toggle_btn.configure(text="MODE: PHYSICAL" if self.physical_mode else "MODE: RELATIVE", 
-                                 fg_color="#1f538d" if self.physical_mode else "#333333")
+        accent = _BROWSER_ACCENT.get(self.current_browser_name, _C["accent"])
+        self.toggle_btn.configure(
+            text="▩  Physical" if self.physical_mode else "▦  Relative",
+            fg_color=accent if self.physical_mode else _C["surface2"],
+            text_color=_C["text"] if self.physical_mode else _C["text_dim"])
+        self.on_tab_changed()
+
+    def _switch_tab(self, name):
+        """Show content frame for the named tab, hide the previous one."""
+        accent = _BROWSER_ACCENT.get(self.current_browser_name, _C["accent"])
+        if self._active_tab and self._active_tab in self._tab_frames:
+            self._tab_frames[self._active_tab].pack_forget()
+            self._tab_btns[self._active_tab].configure(text_color=_C["text_dim"])
+            self._tab_indicators[self._active_tab].configure(fg_color="transparent")
+        self._active_tab = name
+        self._tab_frames[name].pack(fill="both", expand=True)
+        self._tab_btns[name].configure(text_color=_C["text"])
+        self._tab_indicators[name].configure(fg_color=accent)
         self.on_tab_changed()
 
     def get_tor_network_artifacts(self, tor_folder):
@@ -318,33 +651,96 @@ class BrowsAR_App(ctk.CTk):
                         info.append(("Total Downloaded", f"{bytes_val / (1024*1024):.2f} MB"))
         return info
     def setup_hex_tab(self, t):
-        container = ctk.CTkFrame(self.tabview.tab(t), fg_color="transparent")
+        container = ctk.CTkFrame(self._tab_frames[t], fg_color=_C["bg"], corner_radius=0)
         container.pack(fill="both", expand=True)
-        
-        txt = ctk.CTkTextbox(container, font=("Consolas", 14), wrap="none", fg_color="#000000", text_color="#ffffff")
-        txt.pack(fill="both", expand=True, padx=10, pady=(10, 5))
+
+        txt = ctk.CTkTextbox(container,
+                             font=(_C["mono"], 13),
+                             wrap="none",
+                             fg_color=_C["bg"],
+                             text_color=_C["text"],
+                             border_width=0,
+                             scrollbar_button_color=_C["border"],
+                             scrollbar_button_hover_color=_C["surface2"])
+        txt.pack(fill="both", expand=True, padx=0, pady=0)
         self.displays[t] = txt
-        
-        nav = ctk.CTkFrame(container, fg_color="transparent", height=40)
-        nav.pack(fill="x", side="bottom", padx=10, pady=5)
-        
-        ctk.CTkButton(nav, text=" < Prev Page ", width=100, command=lambda tab=t: self.change_page(tab, -1)).pack(side="left")
-        ctk.CTkButton(nav, text=" Next Page > ", width=100, command=lambda tab=t: self.change_page(tab, 1)).pack(side="right")
+
+        nav = ctk.CTkFrame(container, fg_color=_C["surface"], corner_radius=0, height=44)
+        nav.pack(fill="x", side="bottom")
+        nav.pack_propagate(False)
+
+        accent = _BROWSER_ACCENT.get(self.current_browser_name, _C["accent"])
+        ctk.CTkButton(nav, text="← Prev", width=90, height=28,
+                      corner_radius=5,
+                      font=(_C["sans"], 12),
+                      fg_color=_C["surface2"], hover_color=_C["border"],
+                      text_color=_C["text"],
+                      command=lambda tab=t: self.change_page(tab, -1)).pack(side="left", padx=12, pady=8)
+        ctk.CTkButton(nav, text="Next →", width=90, height=28,
+                      corner_radius=5,
+                      font=(_C["sans"], 12),
+                      fg_color=_C["surface2"], hover_color=_C["border"],
+                      text_color=_C["text"],
+                      command=lambda tab=t: self.change_page(tab, 1)).pack(side="right", padx=12, pady=8)
 
     def setup_registry_explorer(self, t):
-        container = ctk.CTkFrame(self.tabview.tab(t), fg_color="#1a1a1a")
-        container.pack(fill="both", expand=True, padx=10, pady=10)
-        
-        self.reg_tree = ttk.Treeview(container, show="tree")
-        self.reg_tree.pack(side="left", fill="both", expand=True)
+        container = ctk.CTkFrame(self._tab_frames[t], fg_color=_C["bg"], corner_radius=0)
+        container.pack(fill="both", expand=True)
+
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Reg.Treeview",
+                        background=_C["surface"],
+                        foreground=_C["text"],
+                        fieldbackground=_C["surface"],
+                        rowheight=24,
+                        borderwidth=0,
+                        font=(_C["mono"], 11))
+        style.configure("Reg.Treeview.Heading",
+                        background=_C["surface2"],
+                        foreground=_C["text_dim"],
+                        relief="flat",
+                        font=(_C["sans"], 10, "bold"))
+        style.map("Reg.Treeview",
+                  background=[("selected", _C["accent_dim"])],
+                  foreground=[("selected", _C["text"])])
+
+        # Use classic tk PanedWindow so bg colour is respected
+        pane = _tk.PanedWindow(container, orient=_tk.HORIZONTAL,
+                               bg=_C["bg"], sashwidth=4,
+                               sashrelief="flat", bd=0)
+        pane.pack(fill="both", expand=True)
+
+        left_frame  = ctk.CTkFrame(pane, fg_color=_C["surface"], corner_radius=0)
+        right_frame = ctk.CTkFrame(pane, fg_color=_C["surface2"], corner_radius=0)
+        pane.add(left_frame,  width=360, minsize=120)
+        pane.add(right_frame, minsize=200)
+
+        # key tree
+        ctk.CTkLabel(left_frame, text="Registry Keys",
+                     font=(_C["sans"], 10, "bold"),
+                     text_color=_C["text_dim"]).pack(anchor="w", padx=12, pady=(10, 4))
+        self.reg_tree = ttk.Treeview(left_frame, show="tree", style="Reg.Treeview")
+        vsb_l = ttk.Scrollbar(left_frame, orient="vertical", command=self.reg_tree.yview)
+        self.reg_tree.configure(yscrollcommand=vsb_l.set)
+        self.reg_tree.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(0, 8))
+        vsb_l.pack(side="right", fill="y", pady=(0, 8))
         self.reg_tree.bind("<<TreeviewSelect>>", self.on_registry_key_selected)
-        
-        self.reg_values = ttk.Treeview(container, columns=("Name", "Data"), show="headings")
-        self.reg_values.heading("Name", text="PROPERTY")
-        self.reg_values.heading("Data", text="VALUE")
-        self.reg_values.column("Name", width=200)
-        self.reg_values.column("Data", width=400)
-        self.reg_values.pack(side="right", fill="both", expand=True)
+
+        # value panel
+        ctk.CTkLabel(right_frame, text="Values",
+                     font=(_C["sans"], 10, "bold"),
+                     text_color=_C["text_dim"]).pack(anchor="w", padx=12, pady=(10, 4))
+        self.reg_values = ttk.Treeview(right_frame, columns=("Name", "Data"),
+                                       show="headings", style="Reg.Treeview")
+        self.reg_values.heading("Name", text="Property")
+        self.reg_values.heading("Data", text="Value")
+        self.reg_values.column("Name", width=180, minwidth=80)
+        self.reg_values.column("Data", width=400, minwidth=100)
+        vsb_r = ttk.Scrollbar(right_frame, orient="vertical", command=self.reg_values.yview)
+        self.reg_values.configure(yscrollcommand=vsb_r.set)
+        self.reg_values.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(0, 8))
+        vsb_r.pack(side="right", fill="y", pady=(0, 8))
         self.refresh_registry_tree()
 
     def get_reg_targets(self):
@@ -406,7 +802,7 @@ class BrowsAR_App(ctk.CTk):
             pass
 
     def on_tab_changed(self):
-        active = self.tabview.get()
+        active = self._active_tab
         if active == "Registry" or active not in self.displays:
             return
         txt = self.displays[active]
@@ -467,7 +863,7 @@ class BrowsAR_App(ctk.CTk):
         return None
 
     def trigger_analysis(self):
-        tab = self.tabview.get()
+        tab = self._active_tab
         # --- Tor Browser (Firefox-based) has its own analysis methods ---
         if self.current_browser_name == "Tor Browser":
             if   tab == "History":   self.analyze_tor_browser_history()
