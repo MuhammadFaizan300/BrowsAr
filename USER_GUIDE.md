@@ -1,4 +1,4 @@
-# BrowsAr User Guide
+# BrowsAR User Guide
 
 ## Table of Contents
 
@@ -17,14 +17,26 @@
 - Windows 10 or Windows 11 system
 - Administrator account access
 - Target browsers (Brave, Chrome, Edge) installed on the system
-- Python 3.8 or higher installed and configured
-- All Python dependencies installed
+- **For installer:** `BrowsAR_Setup.exe` (no Python required)
+- **For source:** Python 3.10+ with all dependencies installed
 
 ## Installation
 
-### Step 1: Environment Setup
+### Option A — Windows Installer (recommended)
 
-1. Download and install Python 3.8+ from official sources
+1. Run `BrowsAR_Setup.exe`
+2. Accept the UAC prompt
+3. Choose an install directory (default: `C:\Program Files\BrowsAR`)
+4. Select whether to create a Desktop shortcut and/or Start Menu entry
+5. Click **Install** and then **Finish**
+
+No Python or additional packages are required.
+
+### Option B — Run from source
+
+#### Step 1: Environment Setup
+
+1. Download and install Python 3.10+ from official sources
 2. Verify Python installation:
 
 ```bash
@@ -32,46 +44,47 @@ python --version
 pip --version
 ```
 
-### Step 2: Dependency Installation
+#### Step 2: Dependency Installation
 
-Navigate to the BrowsAr directory and install required packages:
-
-```bash
-pip install customtkinter Cryptodome pywin32 psutil websocket-client requests
-```
-
-### Step 3: Administrator Privileges
-
-Grant administrator privileges to your Python environment or run the application with elevated permissions:
+Navigate to the project root and install required packages:
 
 ```bash
-python browsar_main.py
+pip install customtkinter Cryptodome pywin32 psutil websocket-client requests pystray Pillow
 ```
 
-Windows will prompt for UAC confirmation. Click "Yes" to proceed.
+#### Step 3: Launch
+
+```bash
+python BrowsAr\browsar_main.py
+```
+
+Windows will prompt for UAC confirmation. Click **Yes** to proceed.
 
 ## Getting Started
 
 ### Launching the Application
 
-1. Open PowerShell or Command Prompt
-2. Navigate to the BrowsAr directory
-3. Execute the main script with administrator privileges:
+**From the installer:** double-click the BrowsAR desktop shortcut or find it in the Start Menu. The application auto-elevates via UAC.
+
+**From source:**
+
+1. Open PowerShell
+2. Navigate to the project root
+3. Run:
 
 ```bash
-python browsar_main.py
+python BrowsAr\browsar_main.py
 ```
 
-The graphical interface will load, displaying the main menu with browser and data type options.
+A splash screen with the BrowsAR logo fades in briefly while the application loads, then fades out to reveal the main window.
 
 ### Understanding the Interface
 
 The main window contains:
-- **Browser Selection Panel** - Checkboxes for Brave, Chrome, and Edge
-- **Data Type Selection Panel** - Options for different data categories
-- **Action Buttons** - Extract, Export, Clear Cache, and Settings
-- **Status Display** - Real-time extraction progress and status messages
-- **Log Viewer** - Detailed operational logs and error messages
+- **Sidebar** — Application logo, navigation buttons, and theme toggle (Dark/Light)
+- **Tab strip** — Scrollable tabs showing open analysis panels
+- **Content area** — Results and details for the selected tab
+- **Status bar** — Real-time extraction progress and status messages
 
 ## Main Interface
 
@@ -157,6 +170,13 @@ Detects and lists Tor network usage:
 - Connection attempts
 - Tor identity information
 
+#### Browser Cache
+Analyses browser cache databases:
+- Cached resource URLs
+- Content types and sizes
+- Cache timestamps
+- Response headers
+
 ## Data Extraction Procedures
 
 ### Single Browser Extraction
@@ -216,6 +236,19 @@ After extraction, data can be exported to multiple formats:
 4. **Execute Export** - Click Export button
 5. **Verify Output** - Confirm file creation and data integrity
 
+## System Tray
+
+BrowsAR minimises to the system tray rather than closing, so analysis results are preserved:
+
+- **Close button (X)** — hides the window to the tray
+- **Minimise button** — hides the window to the tray
+- **Tray icon double-click** — restores the window
+- **Tray icon right-click → Exit** — fully quits the application
+
+## Theme Toggle
+
+Click the **Dark / Light** button in the sidebar to switch themes. The transition is animated smoothly. The chosen theme persists for the current session.
+
 ## Advanced Operations
 
 ### Hex Viewer Utility
@@ -230,11 +263,7 @@ Used for analyzing encrypted payloads, database headers, and raw binary structur
 
 ### Browser Cache Clearing
 
-The application can optionally clear temporary extraction data:
-1. Click "Settings" in the main menu
-2. Select "Clear Cache" option
-3. Confirm the action
-4. Cache files are removed from temporary storage
+The application includes a dedicated **Cache** tab per browser for analysing cached resources. To clear the application's own temporary extraction files, restart the application — temporary files are cleaned on each fresh run.
 
 ### Profile-Specific Extraction
 

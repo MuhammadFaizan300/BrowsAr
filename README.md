@@ -1,8 +1,8 @@
-# BrowsAr - Browser Data Extraction Tool
+# BrowsAR - Browser Forensic Suite
 
 ## Overview
 
-BrowsAr is a Windows-based data extraction utility designed to retrieve sensitive information from web browsers including Brave, Google Chrome, and Microsoft Edge. The tool supports extraction of cookies, browsing history, passwords, bookmarks, autofill data, prefetch data, Tor activity, and registry entries. It provides a graphical user interface for streamlined data access and analysis.
+BrowsAR is a Windows-based browser forensics tool designed to retrieve and analyse data from Brave, Google Chrome, and Microsoft Edge. It supports extraction of cookies, browsing history, passwords, bookmarks, autofill data, prefetch data, Tor activity, registry entries, and browser caches. The application ships as a traditional Windows installer and features a modern dark/light-themed GUI with system tray integration and a branded splash screen.
 
 ## System Requirements
 
@@ -23,6 +23,8 @@ pywin32>=305
 psutil>=5.9.0
 websocket-client>=1.3.0
 requests>=2.28.0
+pystray>=0.19.0
+Pillow>=10.0.0
 ```
 
 ### Windows APIs
@@ -34,38 +36,76 @@ requests>=2.28.0
 
 ## Installation
 
-1. Install Python 3.8 or higher from python.org
-2. Clone or extract the BrowsAr repository
-3. Install required dependencies:
+### Option A — Windows Installer (recommended)
+
+1. Run `BrowsAR_Setup.exe`
+2. Follow the wizard: choose install path, optional desktop/Start Menu shortcuts
+3. Launch **BrowsAR** from the desktop shortcut or Start Menu
+
+The installer handles all dependencies and registers the application. UAC will prompt for elevation on first launch.
+
+### Option B — Run from source
+
+1. Install Python 3.10+ from python.org
+2. Clone or extract the repository
+3. Create and activate a virtual environment:
 
 ```bash
-pip install -r requirements.txt
+python -m venv .venv
+.venv\Scripts\activate
 ```
 
-4. Grant Administrator privileges to the Python executable or run the script with elevated permissions
+4. Install dependencies:
+
+```bash
+pip install customtkinter Cryptodome pywin32 psutil websocket-client requests pystray Pillow
+```
+
+5. Run with administrator privileges:
+
+```bash
+python BrowsAr\browsar_main.py
+```
+
+### Building the installer from source
+
+Requires Python + venv set up as above, plus [NSIS](https://nsis.sourceforge.io/) installed.
+
+```powershell
+.\build.ps1
+```
+
+This runs PyInstaller then NSIS and produces `BrowsAR_Setup.exe` in the project root.
 
 ## Project Structure
 
 ```
-BrowsAr/
-├── browsar_main.py              # Main application entry point with GUI
-├── brave_autofill.py            # Brave autofill data extraction
-├── brave_bookmark.py            # Brave bookmark extraction
-├── brave_cookies.py             # Brave cookie extraction and decryption
-├── brave_downloads.py           # Brave download history
-├── brave_history.py             # Brave browsing history
-├── brave_passwords.py           # Brave password vault extraction
-├── brave_prefetch.py            # Brave prefetch data analysis
-├── brave_registry.py            # Brave registry data extraction
-├── brave_tor.py                 # Brave Tor network activity detection
-├── chrome_downloads.py          # Chrome download history
-├── chrome_passwords.py          # Chrome password vault extraction
-├── chrome_prefetch.py           # Chrome prefetch data analysis
-├── chrome_registry.py           # Chrome registry data extraction
-├── edge_downloads.py            # Edge download history
-├── edge_registry.py             # Edge registry data extraction
-├── edge_prefetch.py             # Edge prefetch data analysis
-└── hex_viewer.py                # Binary data hex viewer utility
+Project/
+├── build.ps1                    # Full build pipeline (PyInstaller + NSIS)
+├── browsar_installer.nsi        # NSIS installer script
+│
+└── BrowsAr/
+    ├── browsar_main.py          # Main application entry point with GUI
+    ├── browsar.spec             # PyInstaller build spec
+    ├── brave_autofill.py        # Brave autofill data extraction
+    ├── brave_bookmark.py        # Brave bookmark extraction
+    ├── brave_cookies.py         # Brave cookie extraction and decryption
+    ├── brave_downloads.py       # Brave download history
+    ├── brave_history.py         # Brave browsing history
+    ├── brave_passwords.py       # Brave password vault extraction
+    ├── brave_prefetch.py        # Brave prefetch data analysis
+    ├── brave_registry.py        # Brave registry data extraction
+    ├── brave_tor.py             # Brave Tor network activity detection
+    ├── chrome_downloads.py      # Chrome download history
+    ├── chrome_passwords.py      # Chrome password vault extraction
+    ├── chrome_prefetch.py       # Chrome prefetch data analysis
+    ├── chrome_registry.py       # Chrome registry data extraction
+    ├── edge_downloads.py        # Edge download history
+    ├── edge_registry.py         # Edge registry data extraction
+    ├── edge.prefetch.py         # Edge prefetch data analysis
+    ├── hex_viewer.py            # Binary data hex viewer utility
+    ├── logo.png                 # Application logo (splash/sidebar/tray)
+    └── browsar.ico              # Application icon (place manually before building)
 ```
 
 ## Key Features
@@ -83,9 +123,17 @@ BrowsAr/
 - Browsing history with timestamps
 - Stored passwords with decryption
 - Prefetch analysis for access patterns
-- System registry entries
+- System registry entries (interactive explorer)
 - Tor activity detection
+- Browser cache analysis
 - Binary data visualization
+
+### Application Features
+- Traditional Windows installer with path and shortcut selection
+- Dark / Light theme toggle with smooth transitions
+- System tray integration — minimise or close hides to tray; double-click to restore
+- Branded splash screen with fade-in / fade-out animation
+- Tabbed interface with scrollable tab strip
 
 ### Technical Capabilities
 - Cryptographic decryption of stored credentials
@@ -124,13 +172,15 @@ BrowsAr/
 
 ## Usage
 
-Execute the main application:
+**Installed:** Launch BrowsAR from the desktop or Start Menu shortcut. The application auto-elevates via UAC.
+
+**From source:**
 
 ```bash
-python browsar_main.py
+python BrowsAr\browsar_main.py
 ```
 
-The GUI will present options to select extraction targets and data types. Elevated privileges are required for full functionality.
+The GUI presents a sidebar for navigation and tabbed panels for each data type. Elevated privileges are required for full functionality. Closing the window minimises the app to the system tray; right-click the tray icon to exit.
 
 ## Security Considerations
 
@@ -175,7 +225,7 @@ This tool is provided for authorized forensic analysis and security research onl
 
 ## Version
 
-BrowsAr v1.0
+BrowsAR v2.0
 
 ## Support
 
