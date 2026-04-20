@@ -423,34 +423,298 @@ class BrowsAR_App(ctk.CTk):
             AnalysisWindow(f"{self.current_browser_name} Bookmarks", self.last_headers, res)
         except Exception as e:
             messagebox.showerror("Forensic Error", str(e))
-    def analyze_tor_private(self):
-        """Master Tor Forensic Engine: Registry, Prefetch, Config, and Network."""
+    # ------------------------------------------------------------------ #
+    #  TIER-1 HELPERS  (called from analyze_tor_private)                 #
+    # ------------------------------------------------------------------ #
+
+    def _tor_scan_amcache(self):
+        """
+        Amcache — records first-execution path and timestamp for every executable.
+        Survives Brave/Tor uninstall entirely.
+        Windows keeps InventoryApplicationFile live under HKLM so we query it
+        directly (no hive loading needed, no SYSTEM requirement).
+        Falls back to a filesystem search of the hive for any 'tor' string if
+        the live key is unavailable.
+        """
         res = []
 
+        # --- Live registry path (Windows 8.1+, always accessible as admin) ---
+        live_root = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Amcache\InventoryApplicationFile"
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, live_root,
+                                0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as root:
+                count = winreg.QueryInfoKey(root)[0]
+                for i in range(count):
+                    try:
+                        subkey_name = winreg.EnumKey(root, i)
+                        with winreg.OpenKey(root, subkey_name,
+                                            0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as sk:
+                            def _val(k, default="N/A"):
+                                try:
+                                    return winreg.QueryValueEx(sk, k)[0]
+                                except OSError:
+                                    return default
+                            name = _val("Name")
+                            path = _val("LowerCaseLongPath")
+                            sha1 = _val("FileId")
+                            link_date = _val("LinkDate")
+                            if "tor" not in name.lower() and "tor" not in path.lower():
+                                continue
+                            sha1_clean = sha1[4:] if isinstance(sha1, str) and sha1.startswith("0000") else sha1
+                            res.append(("Amcache | First-Run Path", path))
+                            res.append(("Amcache | File Name", name))
+                            res.append(("Amcache | SHA-1 Hash", sha1_clean))
+                            res.append(("Amcache | Link Date", link_date))
+                    except OSError:
+                        continue
+        except OSError:
+            # Live key not present — fall back to binary grep of the hive file
+            hive = r"C:\Windows\AppCompat\Programs\Amcache.hve"
+            if os.path.exists(hive):
+                try:
+                    with open(hive, "rb") as f:
+                        raw = f.read()
+                    text = raw.decode("utf-16-le", errors="ignore")
+                    import re as _re
+                    for m in _re.finditer(r'[a-zA-Z]:\\[^\x00\r\n]{4,200}[Tt][Oo][Rr][^\x00\r\n]{0,80}', text):
+                        res.append(("Amcache (raw grep) | Path", m.group(0).strip()))
+                except OSError:
+                    res.append(("Amcache", "Hive file locked and live key unavailable"))
+            else:
+                res.append(("Amcache", "InventoryApplicationFile key not found (requires Win8.1+)"))
+
+        if not res:
+            res.append(("Amcache", "No tor-related entries found"))
+        return res
+
+    def _tor_scan_shimcache(self):
+        """
+        AppCompatCache (ShimCache) — logs every executable that touched the
+        filesystem.  Proves tor.exe existed at a path even after deletion.
+        The blob is a Windows 10/11 SHIM cache: 128-byte header followed by
+        variable-length entries.  Each entry contains a UTF-16LE path.
+        We extract paths using a regex on the raw blob to avoid full format
+        parsing while still producing clean results.
+        """
+        res = []
+        import re as _re
+        try:
+            reg_path = r"SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache"
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path,
+                                0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
+                raw, _ = winreg.QueryValueEx(key, "AppCompatCache")
+
+            # Extract clean Windows paths from the binary blob.
+            # Strategy: find sequences of UTF-16LE characters that form a valid
+            # drive-letter path (e.g. C:\...) by scanning the raw bytes for the
+            # pattern [A-Z]: (0x3A 0x00 follows the drive letter in UTF-16LE).
+            # Each path ends at the first non-path byte pair.
+            path_pattern = _re.compile(
+                rb'(?:[A-Za-z]\x00:\x00\\\x00)(?:[^\x00\x01-\x1f]\x00){4,255}'
+            )
+            # Only keep paths genuinely tor-related:
+            # filename is tor.exe, or path contains tor-browser/torbrowser/\Tor\
+            import re as _re_sc
+            tor_relevant = _re_sc.compile(
+                r'(?i)(?:[/\\]tor\.exe$|tor[\s_-]browser|torbrowser|[/\\][Tt]or[/\\])'
+            )
+            for m in path_pattern.finditer(raw):
+                try:
+                    path = m.group(0).decode("utf-16-le", errors="ignore").rstrip("\x00").strip()
+                    if tor_relevant.search(path) and len(path) > 6:
+                        res.append(("ShimCache | Executable Path", path))
+                except Exception:
+                    continue
+
+        except OSError as ex:
+            res.append(("ShimCache", f"Access error: {ex}"))
+            return res
+
+        if not res:
+            res.append(("ShimCache", "No tor-related executables found in AppCompatCache"))
+        return res
+
+    def _tor_scan_eventlog(self):
+        """
+        Windows Security Event Log — Event ID 4688 (Process Creation).
+        Requires 'Audit Process Creation' policy to be enabled on the system.
+        Uses wevtutil to query without needing the win32evtlog library.
+        """
+        res = []
+        cmd = (
+            'wevtutil qe Security '
+            '/q:"*[System[EventID=4688]] and *[EventData[Data[@Name=\'NewProcessName\'] and contains(.,\'tor\')]]" '
+            '/f:text /rd:true /c:50'
+        )
+        try:
+            out = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL,
+                                          timeout=15).decode("utf-8", errors="ignore")
+            if out.strip():
+                for line in out.splitlines():
+                    line = line.strip()
+                    if any(k in line for k in ("Date", "New Process Name", "Creator Process",
+                                               "Account Name", "Process ID")):
+                        res.append(("Event Log (4688)", line))
+            else:
+                res.append(("Event Log (4688)", "No process-creation events for tor.exe found"))
+        except subprocess.TimeoutExpired:
+            res.append(("Event Log (4688)", "Query timed out"))
+        except subprocess.CalledProcessError:
+            res.append(("Event Log (4688)", "Access denied or audit policy not enabled"))
+        return res
+
+    # ------------------------------------------------------------------ #
+    #  TIER-2 HELPERS                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _tor_scan_preferences_onion(self):
+        """
+        Brave Preferences — full-text grep for ANY .onion reference across the
+        entire JSON, plus brave.tor.* config keys.  Scanning just
+        content_settings.exceptions misses most cases because Brave only writes
+        there when the user explicitly grants a site permission.
+        """
+        import re as _re_p
+        onion_re = _re_p.compile(r'[a-z2-7]{16,56}\.onion(?:/[^\s"<>]{0,80})?')
+        res = []
+        prefs_file = os.path.join(self.current_browser_path, "Default", "Preferences")
+        if not os.path.exists(prefs_file):
+            return [("Preferences", "Default/Preferences not found")]
+
+        tmp = "prefs_tor_scan_tmp.json"
+        try:
+            shutil.copyfile(prefs_file, tmp)
+            with open(tmp, "r", encoding="utf-8") as f:
+                raw_text = f.read()
+            prefs = json.loads(raw_text)
+
+            # Full-text grep — catches any key/value containing an onion address
+            found_onion = sorted(set(m.group(0) for m in onion_re.finditer(raw_text)))
+            if found_onion:
+                for addr in found_onion:
+                    res.append(("Preferences | Onion Address", addr))
+            else:
+                res.append(("Preferences Onion Scan", "No .onion addresses found in Preferences"))
+
+            # brave.tor.* configuration keys
+            brave_tor = prefs.get("brave", {}).get("tor", {})
+            if brave_tor:
+                for k, v in brave_tor.items():
+                    res.append((f"Brave Tor Config | {k}", str(v)))
+            else:
+                res.append(("Brave Tor Config", "No brave.tor keys in Preferences"))
+
+            # Top-level tor_disabled flag
+            tor_disabled = prefs.get("brave", {}).get("tor_disabled", None)
+            if tor_disabled is not None:
+                res.append(("Brave Tor Disabled Flag", str(tor_disabled)))
+
+        except Exception as e:
+            res.append(("Preferences Scan Error", str(e)))
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return res
+
+    def _tor_scan_tor_data_dir(self):
+        """
+        Scans two sources for .onion evidence:
+        1. Brave's internal Tor data directory (User Data\\tor\\data) — contains
+           guard node state, cached circuits, and Tor's own runtime files.
+        2. Binary-greps EVERY Brave profile's session files for .onion URLs.
+           Brave Tor windows may write to a separate profile sub-directory, so
+           we scan all profile dirs (Default, Profile 1, etc.) instead of only
+           Default.
+        """
+        import re as _re_t
+        onion_re = _re_t.compile(r'[a-z2-7]{16,56}\.onion(?:/[^\x00\s"<>]{0,80})?')
+        res = []
+
+        # --- 1. Tor internal data directory ---
+        tor_data = os.path.join(self.current_browser_path, "tor", "data")
+        if os.path.exists(tor_data):
+            for root_d, dirs, files in os.walk(tor_data):
+                for fname in files:
+                    fpath = os.path.join(root_d, fname)
+                    try:
+                        stat = os.stat(fpath)
+                        rel = os.path.relpath(fpath, tor_data)
+                        res.append(("Tor Data Dir | File",
+                                    f"{rel}  ({stat.st_size}B  "
+                                    f"mod:{datetime.datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S')})"))
+                        if stat.st_size < 512 * 1024:
+                            with open(fpath, "rb") as f:
+                                content = f.read().decode("latin-1", errors="ignore")
+                            for m in onion_re.finditer(content):
+                                res.append((f"Tor Data | {fname} | Onion Ref", m.group(0)))
+                    except OSError:
+                        pass
+        else:
+            res.append(("Tor Data Directory",
+                        "Not found — Brave Tor window not yet used, or data was cleared"))
+
+        # --- 2. Session files across ALL profile directories ---
+        session_files = ["Last Session", "Last Tabs", "Current Session", "Current Tabs"]
+        found_any_onion = False
+        try:
+            for entry in os.listdir(self.current_browser_path):
+                profile_dir = os.path.join(self.current_browser_path, entry)
+                if not os.path.isdir(profile_dir):
+                    continue
+                for sfile in session_files:
+                    fpath = os.path.join(profile_dir, sfile)
+                    if not os.path.exists(fpath):
+                        continue
+                    try:
+                        with open(fpath, "rb") as f:
+                            raw = f.read()
+                        text = raw.decode("latin-1", errors="ignore")
+                        for m in onion_re.finditer(text):
+                            res.append((f"Session | {entry}/{sfile}", m.group(0)))
+                            found_any_onion = True
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+        if not found_any_onion:
+            res.append(("Session/Profile Onion Scan",
+                        "No .onion addresses found in any profile session file"))
+        return res
+
+    # ------------------------------------------------------------------ #
+    #  MASTER TOR ANALYZER                                                #
+    # ------------------------------------------------------------------ #
+
+    def analyze_tor_private(self):
+        """Master Tor Forensic Engine — Tier 1 & 2 artifact extraction."""
+        res = []
+
+        # --- Component presence ---
         comp = os.path.join(self.current_browser_path, "cpoalefficncklhjfpglfiplenlpccdb")
         if os.path.exists(comp):
             m_time = datetime.datetime.fromtimestamp(os.path.getmtime(comp))
             res.append(("Tor Plugin Status", f"INSTALLED/INITIALIZED: {m_time}"))
-            
-        # 1. Timeline Analysis (Prefetch)
+
+        # --- 1. Prefetch execution timeline ---
         pf_dir = r"C:\Windows\Prefetch"
         if os.path.exists(pf_dir):
             for f in os.listdir(pf_dir):
                 if "TOR" in f.upper() and f.endswith(".pf"):
                     times = get_prefetch_history(os.path.join(pf_dir, f))
                     for i, t in enumerate(times):
-                        res.append((f"Execution Time {i+1}", t))
+                        res.append((f"Prefetch Exec Time {i+1}", t))
 
-        # 2. Bridge & Volume Extraction
+        # --- 2. Bridge & network volume (tor-torrc + state file) ---
         tor_comp = os.path.join(self.current_browser_path, "cpoalefficncklhjfpglfiplenlpccdb")
         if os.path.exists(tor_comp):
-            # Use os.walk to find the version folder (e.g. 1.0.42)
             for root, dirs, files in os.walk(tor_comp):
                 if "tor-torrc" in files:
-                    net_data = self.get_tor_network_artifacts(root)
-                    res.extend(net_data)
+                    res.extend(self.get_tor_network_artifacts(root))
 
-        # 3. Registry History (Keep original logic)
+        # --- 3. UserAssist registry (ROT-13 decoded) ---
         try:
             ua_path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist\{CEBFF5CD-ACE2-4F4F-9178-9926F41749EA}\Count"
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, ua_path) as key:
@@ -458,8 +722,26 @@ class BrowsAR_App(ctk.CTk):
                     n, d, _ = winreg.EnumValue(key, i)
                     decoded = rot13(n)
                     if "tor" in decoded.lower():
-                        res.append(("Registry Record", f"{decoded} (Runs: {struct.unpack('<I', d[4:8])[0]})"))
-        except: pass
+                        res.append(("UserAssist Registry", f"{decoded} (Runs: {struct.unpack('<I', d[4:8])[0]})"))
+        except Exception:
+            pass
+
+        # ============================================================== #
+        #  TIER 1 — Prove Tor was used (survives uninstall)              #
+        # ============================================================== #
+        res.append(("--- TIER 1: PERSISTENCE EVIDENCE ---", ""))
+
+        res.extend(self._tor_scan_amcache())
+        res.extend(self._tor_scan_shimcache())
+        res.extend(self._tor_scan_eventlog())
+
+        # ============================================================== #
+        #  TIER 2 — Prove what sites were visited                        #
+        # ============================================================== #
+        res.append(("--- TIER 2: VISITED SITES EVIDENCE ---", ""))
+
+        res.extend(self._tor_scan_preferences_onion())
+        res.extend(self._tor_scan_tor_data_dir())
 
         self.last_results, self.last_headers = res, ["Forensic Artifact", "Extracted Evidence"]
         AnalysisWindow("Brave TOR - Full Forensic Profile", self.last_headers, res)
