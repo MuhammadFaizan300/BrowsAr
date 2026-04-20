@@ -38,6 +38,48 @@ def rot13(text):
         else: res += char
     return res
 
+def find_tor_browser():
+    """Locate the Tor Browser installation root directory."""
+    home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(home, "Desktop",   "Tor Browser"),
+        os.path.join(home, "Downloads", "Tor Browser"),
+        os.path.join(home, "Documents", "Tor Browser"),
+        os.path.join(home, "AppData", "Local", "Tor Browser"),
+        r"C:\Program Files\Tor Browser",
+        r"C:\Program Files (x86)\Tor Browser",
+    ]
+    for d in candidates:
+        if os.path.exists(os.path.join(d, "Browser", "firefox.exe")):
+            return d
+    # NSIS installer registry entry
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Tor Browser") as k:
+            loc = winreg.QueryValueEx(k, "InstallLocation")[0]
+            if os.path.exists(loc):
+                return loc
+    except OSError:
+        pass
+    # MuiCache fallback
+    try:
+        mui = (r"Software\Classes\Local Settings\Software\Microsoft"
+               r"\Windows\Shell\MuiCache")
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, mui) as k:
+            for i in range(winreg.QueryInfoKey(k)[1]):
+                n, _, _ = winreg.EnumValue(k, i)
+                nl = n.lower()
+                if "tor browser" in nl and "firefox.exe" in nl:
+                    marker = "\\browser\\firefox.exe"
+                    idx = nl.find(marker)
+                    if idx != -1:
+                        root = n[:idx]
+                        if os.path.exists(root):
+                            return root
+    except OSError:
+        pass
+    return None
+
 def impersonate_system():
     try:
         h_token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), 
@@ -191,6 +233,9 @@ class BrowsAR_App(ctk.CTk):
             "Chrome": os.path.join(os.environ['LOCALAPPDATA'], r"Google\Chrome\User Data"),
             "Edge": os.path.join(os.environ['LOCALAPPDATA'], r"Microsoft\Edge\User Data")
         }
+        _tor_root = find_tor_browser()
+        if _tor_root:
+            self.browser_paths["Tor Browser"] = _tor_root
 
         for name in self.browser_paths:
             if os.path.exists(self.browser_paths[name]):
@@ -225,6 +270,9 @@ class BrowsAR_App(ctk.CTk):
             tabs.append("TOR-Private")
         elif name in ("Chrome", "Edge"):
             tabs.append("Cookies")
+        elif name == "Tor Browser":
+            tabs = ["Hex Explorer", "Passwords", "History", "Downloads", "Bookmarks",
+                    "Autofill", "Registry", "Prefetch", "Cookies", "Tor State"]
         
         for t in tabs: 
             self.tabview.add(t)
@@ -310,6 +358,17 @@ class BrowsAR_App(ctk.CTk):
             return [(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Google\Chrome"), 
                     (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Google\Update\ClientState\{8A69D345-D564-463c-AFF1-A69D9E530F96}"), 
                     (winreg.HKEY_CURRENT_USER, r"Software\Google\Chrome")]
+        elif self.current_browser_name == "Tor Browser":
+            return [
+                (winreg.HKEY_CURRENT_USER,
+                 r"Software\Microsoft\Windows\CurrentVersion\Explorer"
+                 r"\UserAssist\{CEBFF5CD-ACE2-4F4F-9178-9926F41749EA}\Count"),
+                (winreg.HKEY_CURRENT_USER,
+                 r"Software\Classes\Local Settings\Software\Microsoft"
+                 r"\Windows\Shell\MuiCache"),
+                (winreg.HKEY_CURRENT_USER,
+                 r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Tor Browser"),
+            ]
         else:
             return [(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Edge"), 
                     (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\ClientState\{56EB18F8-8008-4CBD-B6D2-8C97FE7E9062}"), 
@@ -361,6 +420,25 @@ class BrowsAR_App(ctk.CTk):
         self.on_tab_changed()
 
     def get_artifact_path(self, active):
+        # --- 0. TOR BROWSER (Firefox-based, completely different layout) ---
+        if self.current_browser_name == "Tor Browser":
+            profile = self._get_tor_browser_profile()
+            tor_data_dir = os.path.join(self.current_browser_path,
+                                        "Browser", "TorBrowser", "Data", "Tor")
+            mapping = {
+                "Hex Explorer": os.path.join(profile, "prefs.js") if profile else None,
+                "Passwords":    os.path.join(profile, "key4.db")  if profile else None,
+                "History":      os.path.join(profile, "places.sqlite") if profile else None,
+                "Downloads":    os.path.join(profile, "places.sqlite") if profile else None,
+                "Bookmarks":    os.path.join(profile, "places.sqlite") if profile else None,
+                "Autofill":     os.path.join(profile, "content-prefs.sqlite") if profile else None,
+                "Cookies":      os.path.join(profile, "cookies.sqlite") if profile else None,
+                "Tor State":    os.path.join(tor_data_dir, "state"),
+                "Registry":     None,
+                "Prefetch":     None,
+            }
+            return mapping.get(active)
+
         # --- 1. TOR-SPECIFIC CHECK (MUST BE FIRST) ---
         # This prevents the "Local State" default from highjacking the path
         if active == "TOR-Private" and self.current_browser_name == "Brave":
@@ -390,6 +468,18 @@ class BrowsAR_App(ctk.CTk):
 
     def trigger_analysis(self):
         tab = self.tabview.get()
+        # --- Tor Browser (Firefox-based) has its own analysis methods ---
+        if self.current_browser_name == "Tor Browser":
+            if   tab == "History":   self.analyze_tor_browser_history()
+            elif tab == "Downloads": self.analyze_tor_browser_downloads()
+            elif tab == "Bookmarks": self.analyze_tor_browser_bookmarks()
+            elif tab == "Autofill":  self.analyze_tor_browser_autofill()
+            elif tab == "Cookies":   self.analyze_tor_browser_cookies()
+            elif tab == "Passwords": self.analyze_tor_browser_passwords()
+            elif tab == "Registry":  self.analyze_tor_browser_registry()
+            elif tab == "Prefetch":  self.analyze_tor_browser_prefetch()
+            elif tab == "Tor State": self.analyze_tor_browser_state()
+            return
         if tab == "Passwords": self.analyze_passwords()
         elif tab == "History": self.analyze_history()
         elif tab == "Downloads": self.analyze_downloads()
@@ -860,18 +950,28 @@ class BrowsAR_App(ctk.CTk):
         AnalysisWindow("History", self.last_headers, data)
 
     def analyze_prefetch_deep(self):
-        exe_map = {"Brave": "BRAVE.EXE", "Chrome": "CHROME.EXE", "Edge": "MSEDGE.EXE"}
-        exe, pf_dir, res = exe_map.get(self.current_browser_name, ""), r"C:\Windows\Prefetch", []
-        if not os.path.exists(pf_dir): return
-        
-        for f in os.listdir(pf_dir):
-            if f.upper().startswith(exe) and f.endswith(".pf"):
-                path = os.path.join(pf_dir, f)
-                stat = os.stat(path)
-                with open(path, "rb") as fd:
-                    h = fd.read(8)
-                    info = f"MAM Compressed | {datetime.datetime.fromtimestamp(stat.st_mtime)}" if h[0:3] == b'MAM' else f"SCCA Standard"
-                res.append((f, info))
+        exe_map = {
+            "Brave":   ["BRAVE.EXE"],
+            "Chrome":  ["CHROME.EXE"],
+            "Edge":    ["MSEDGE.EXE"],
+        }
+        exe_names = exe_map.get(self.current_browser_name, [])
+        pf_dir, res = r"C:\Windows\Prefetch", []
+        if not os.path.exists(pf_dir):
+            self.last_results, self.last_headers = [("Prefetch", "Prefetch disabled")], ["Artifact", "Data"]
+            AnalysisWindow("Prefetch", self.last_headers, self.last_results)
+            return
+
+        for exe in exe_names:
+            for f in os.listdir(pf_dir):
+                if f.upper().startswith(exe) and f.endswith(".pf"):
+                    path = os.path.join(pf_dir, f)
+                    stat = os.stat(path)
+                    with open(path, "rb") as fd:
+                        h = fd.read(8)
+                    info = (f"MAM Compressed | {datetime.datetime.fromtimestamp(stat.st_mtime)}"
+                            if h[0:3] == b'MAM' else "SCCA Standard")
+                    res.append((f, info))
         self.last_results, self.last_headers = res, ["Artifact", "Data"]
         AnalysisWindow("Prefetch", self.last_headers, res)
 
@@ -1004,8 +1104,233 @@ class BrowsAR_App(ctk.CTk):
         edge_exe = next((p for p in _edge_candidates if os.path.exists(p)), _edge_candidates[0])
         self._cdp_extract_cookies("Edge", edge_exe, "msedge.exe", self.current_browser_path)
 
+    # ================================================================== #
+    #  TOR BROWSER FORENSIC METHODS                                      #
+    # ================================================================== #
+
+    def _get_tor_browser_profile(self):
+        """Return the active Tor Browser profile directory, or None."""
+        base = os.path.join(self.current_browser_path,
+                            "Browser", "TorBrowser", "Data", "Browser")
+        std = os.path.join(base, "profile.default")
+        if os.path.exists(std):
+            return std
+        if os.path.exists(base):
+            for entry in os.listdir(base):
+                if entry.startswith("profile") and os.path.isdir(os.path.join(base, entry)):
+                    return os.path.join(base, entry)
+        return None
+
+    def analyze_tor_browser_history(self):
+        from tor_history import get_tor_history
+        profile = self._get_tor_browser_profile()
+        if not profile:
+            messagebox.showerror("Forensic Error", "Tor Browser profile not found.")
+            return
+        res = get_tor_history(profile)
+        self.last_results, self.last_headers = res, ["URL", "Title", "Visits", "Last Visit"]
+        AnalysisWindow("Tor Browser — Browsing History", self.last_headers, res)
+
+    def analyze_tor_browser_downloads(self):
+        from tor_downloads import get_tor_downloads
+        profile = self._get_tor_browser_profile()
+        if not profile:
+            messagebox.showerror("Forensic Error", "Tor Browser profile not found.")
+            return
+        res = get_tor_downloads(profile)
+        self.last_results, self.last_headers = res, ["Source URL", "Local Path", "Time", "Size", "Status"]
+        AnalysisWindow("Tor Browser — Download History", self.last_headers, res)
+
+    def analyze_tor_browser_bookmarks(self):
+        from tor_bookmarks import get_tor_bookmarks
+        profile = self._get_tor_browser_profile()
+        if not profile:
+            messagebox.showerror("Forensic Error", "Tor Browser profile not found.")
+            return
+        res = get_tor_bookmarks(profile)
+        self.last_results, self.last_headers = res, ["Title", "URL", "Date Added", "Last Modified"]
+        AnalysisWindow("Tor Browser — Bookmarks", self.last_headers, res)
+
+    def analyze_tor_browser_autofill(self):
+        from tor_autofill import get_tor_autofill
+        profile = self._get_tor_browser_profile()
+        if not profile:
+            messagebox.showerror("Forensic Error", "Tor Browser profile not found.")
+            return
+        res = get_tor_autofill(profile)
+        self.last_results, self.last_headers = res, ["Source", "Key / Site", "Value / Setting", "Details"]
+        AnalysisWindow("Tor Browser — Autofill & Site Preferences", self.last_headers, res)
+
+    def analyze_tor_browser_cookies(self):
+        from tor_cookies import get_tor_cookies
+        profile = self._get_tor_browser_profile()
+        if not profile:
+            messagebox.showerror("Forensic Error", "Tor Browser profile not found.")
+            return
+        res = get_tor_cookies(profile)
+        self.last_results, self.last_headers = res, ["Host", "Name", "Value", "Path", "Last Accessed", "Flags"]
+        AnalysisWindow("Tor Browser — Cookies", self.last_headers, res)
+
+    def analyze_tor_browser_passwords(self):
+        from tor_passwords import get_tor_passwords
+        profile = self._get_tor_browser_profile()
+        if not profile:
+            messagebox.showerror("Forensic Error", "Tor Browser profile not found.")
+            return
+        res = get_tor_passwords(profile, self.current_browser_path)
+        self.last_results, self.last_headers = res, ["URL", "Username", "Password"]
+        AnalysisWindow("Tor Browser — Credentials (NSS)", self.last_headers, res)
+
+    def analyze_tor_browser_registry(self):
+        from tor_registry import get_tor_registry
+        res = get_tor_registry()
+        self.last_results, self.last_headers = res, ["Registry Artifact", "Value"]
+        AnalysisWindow("Tor Browser — Registry Artifacts", self.last_headers, res)
+
+    def analyze_tor_browser_prefetch(self):
+        from tor_prefetch import get_tor_prefetch
+        res = get_tor_prefetch()
+        self.last_results, self.last_headers = res, ["Artifact", "Value"]
+        AnalysisWindow("Tor Browser — Prefetch Evidence", self.last_headers, res)
+
+    def analyze_tor_browser_state(self):
+        """
+        Parse Tor daemon config, state file, onion-aliases, and session store.
+        This is the richest forensic source for Tor Browser — the state file
+        contains guard node RSA fingerprints, bridge IP:port pairs, and the
+        exact timestamps of every Tor session on this machine.
+        """
+        import re as _re
+        res = []
+        profile   = self._get_tor_browser_profile()
+        tor_data  = os.path.join(self.current_browser_path,
+                                 "Browser", "TorBrowser", "Data", "Tor")
+        browser_dir = os.path.join(self.current_browser_path, "Browser")
+
+        # --- Tor Browser version ---
+        for ini in ("application.ini",
+                    os.path.join("TorBrowser", "Data", "Browser", "application.ini")):
+            ini_path = os.path.join(browser_dir, ini)
+            if os.path.exists(ini_path):
+                try:
+                    with open(ini_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            if line.startswith(("Version=", "BuildID=")):
+                                k, v = line.strip().split("=", 1)
+                                res.append((f"Tor Browser | {k}", v))
+                except OSError:
+                    pass
+                break
+
+        # --- torrc configuration ---
+        torrc_path = os.path.join(tor_data, "torrc")
+        if os.path.exists(torrc_path):
+            try:
+                with open(torrc_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            res.append(("torrc | Config", line))
+            except OSError:
+                res.append(("torrc", "Read error"))
+        else:
+            res.append(("torrc", "Not found — Tor daemon not yet initialised"))
+
+        # --- state file (guard nodes, bridges, bandwidth, timestamps) ---
+        state_path = os.path.join(tor_data, "state")
+        if os.path.exists(state_path):
+            stat = os.stat(state_path)
+            res.append(("State File | Size",
+                         f"{stat.st_size} bytes"))
+            res.append(("State File | Last Modified",
+                         datetime.datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S')))
+            try:
+                with open(state_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        kw = line.split()[0] if line.split() else ""
+                        if kw in ("Guard", "TotalWriteBytes", "TotalReadBytes",
+                                  "LastWritten", "MinutesSinceUserActivity",
+                                  "TorVersion", "Dormant", "TotalBuildTimes"):
+                            res.append((f"State | {kw}", line))
+            except OSError:
+                pass
+        else:
+            res.append(("State File",
+                         "Not found — Tor connection never established on this machine"))
+
+        # --- All files in Tor data directory ---
+        if os.path.exists(tor_data):
+            res.append(("--- Tor Data Directory ---", tor_data))
+            for fname in sorted(os.listdir(tor_data)):
+                fpath = os.path.join(tor_data, fname)
+                if os.path.isfile(fpath):
+                    try:
+                        s = os.stat(fpath)
+                        res.append(("Tor Data | File",
+                                     f"{fname}  ({s.st_size}B  "
+                                     f"mod:{datetime.datetime.fromtimestamp(s.st_mtime).strftime('%Y-%m-%d %H:%M:%S')})"))
+                    except OSError:
+                        pass
+
+        # --- onion-aliases.json (SecureDrop .onion alias database) ---
+        if profile:
+            aliases_path = os.path.join(profile, "onion-aliases.json")
+            if os.path.exists(aliases_path):
+                try:
+                    with open(aliases_path, "r", encoding="utf-8") as f:
+                        aliases = json.load(f)
+                    res.append(("Onion Aliases | Last Check",
+                                 str(aliases.get("lastCheck", "N/A"))))
+                    for ch in aliases.get("channels", []):
+                        res.append(("Onion Aliases | Channel", ch.get("name", "?")))
+                        res.append(("Onion Aliases | Scope", ch.get("scope", "?")))
+                        for m in ch.get("mappings", []):
+                            res.append(("Onion Aliases | Mapping",
+                                         f"{m.get('from', '?')}  →  {m.get('to', '?')}"))
+                except Exception as e:
+                    res.append(("Onion Aliases | Error", str(e)))
+
+        # --- sessionstore.jsonlz4 (last session tabs, may contain .onion URLs) ---
+        if profile:
+            ss_path = os.path.join(profile, "sessionstore.jsonlz4")
+            if os.path.exists(ss_path):
+                try:
+                    import lz4.block as _lz4
+                    with open(ss_path, "rb") as f:
+                        magic = f.read(8)       # b'mozLz40\x00'
+                        orig_len = struct.unpack("<I", f.read(4))[0]
+                        compressed = f.read()
+                    raw_json = _lz4.decompress(compressed, uncompressed_size=orig_len)
+                    session = json.loads(raw_json.decode("utf-8"))
+                    onion_re = _re.compile(r'[a-z2-7]{16,56}\.onion(?:/[^\s"<>]{0,80})?')
+                    found = set()
+                    for win in session.get("windows", []):
+                        for tab in win.get("tabs", []):
+                            for entry in tab.get("entries", []):
+                                url = entry.get("url", "")
+                                res.append(("Session Tab", url))
+                                for m in onion_re.finditer(url):
+                                    found.add(m.group(0))
+                    for addr in sorted(found):
+                        res.append(("Session | Onion Address", addr))
+                    if not found:
+                        res.append(("Session Onion Scan", "No .onion addresses in last session"))
+                except ImportError:
+                    res.append(("sessionstore.jsonlz4",
+                                 "lz4 package not installed — run: pip install lz4"))
+                except Exception as e:
+                    res.append(("sessionstore.jsonlz4 | Error", str(e)))
+
+        if not res:
+            res.append(("Tor State", "No Tor Browser data found"))
+
+        self.last_results, self.last_headers = res, ["Forensic Artifact", "Value"]
+        AnalysisWindow("Tor Browser — Tor State & Network Artifacts", self.last_headers, res)
+
     def export_evidence(self):
-        if not self.last_results: return
         f = filedialog.asksaveasfilename(defaultextension=".html", filetypes=[("HTML Report", "*.html"), ("CSV", "*.csv")])
         if f: 
             html = f"<html><body style='font-family:monospace; background:#121212; color:white;'><h1>Report: {self.current_browser_name}</h1><table border='1'>"
