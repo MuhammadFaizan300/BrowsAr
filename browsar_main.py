@@ -645,12 +645,74 @@ class BrowsAR_App(ctk.CTk):
         except Exception as e: messagebox.showerror("Bypass Failed", f"Error: {e}")
 
     def analyze_chrome_cookies(self):
-        _chrome_candidates = [
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        ]
-        chrome_exe = next((p for p in _chrome_candidates if os.path.exists(p)), _chrome_candidates[0])
-        self._cdp_extract_cookies("Chrome", chrome_exe, "chrome.exe", self.current_browser_path)
+        """
+        Direct SQLite + two-stage DPAPI decryption — no CDP / headless launch needed.
+        Chrome refuses to bind the remote-debugging port when the parent process is
+        elevated (admin), so the CDP approach is fundamentally broken on this tool.
+        Instead we replicate the same master-key extraction used for passwords and
+        decrypt each cookie's encrypted_value directly from the SQLite database.
+        """
+        try:
+            # 1. Load Local State and extract master key (identical to analyze_passwords)
+            ls_path = self.get_artifact_path("Hex Explorer")  # resolves to "Local State"
+            if not ls_path:
+                messagebox.showerror("Forensic Error", "Could not locate Chrome Local State.")
+                return
+            with open(ls_path, "r", encoding="utf-8") as f:
+                ls = json.load(f)
+
+            os_crypt = ls.get("os_crypt", {})
+            if "app_bound_encrypted_key" in os_crypt:
+                raw_key = base64.b64decode(os_crypt["app_bound_encrypted_key"])[4:]
+                s1 = None
+                if impersonate_system():
+                    try:
+                        s1 = win32crypt.CryptUnprotectData(raw_key, None, None, None, 0)[1]
+                    finally:
+                        win32security.RevertToSelf()
+                if s1 is None:
+                    messagebox.showerror("Forensic Error", "SYSTEM impersonation failed; cannot decrypt Chrome cookies.")
+                    return
+                final_key = win32crypt.CryptUnprotectData(s1, None, None, None, 0)[1][-32:]
+            else:
+                final_key = win32crypt.CryptUnprotectData(
+                    base64.b64decode(os_crypt["encrypted_key"])[5:], None, None, None, 0)[1]
+
+            # 2. Copy and query the Cookies SQLite database
+            cookie_path = self.get_artifact_path("Cookies")
+            if not cookie_path:
+                messagebox.showerror("Forensic Error", "Could not locate Chrome Cookies database.")
+                return
+            temp_db = "temp_chrome_cookies.db"
+            shutil.copyfile(cookie_path, temp_db)
+            res = []
+            try:
+                conn = sqlite3.connect(temp_db)
+                cur = conn.cursor()
+                cur.execute("SELECT host_key, name, encrypted_value FROM cookies")
+                for host, name, enc_val in cur.fetchall():
+                    try:
+                        iv = enc_val[3:15]
+                        payload = enc_val[15:]
+                        ciphertext, tag = payload[:-16], payload[-16:]
+                        cipher = AES.new(final_key, AES.MODE_GCM, iv)
+                        value = cipher.decrypt_and_verify(ciphertext, tag).decode("utf-8", errors="ignore")
+                    except Exception:
+                        value = "[Encrypted]"
+                    display_val = value[:50] + ("..." if len(value) > 50 else "")
+                    res.append((host, name, display_val))
+                conn.close()
+            finally:
+                try:
+                    os.remove(temp_db)
+                except OSError:
+                    pass
+
+            self.last_results, self.last_headers = res, ["Domain", "Name", "Value"]
+            AnalysisWindow("Chrome Cookies (Direct Decrypt)", self.last_headers, res)
+
+        except Exception as e:
+            messagebox.showerror("Forensic Error", str(e))
 
     def analyze_edge_cookies(self):
         _edge_candidates = [
