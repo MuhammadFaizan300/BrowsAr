@@ -2,3 +2,30 @@
 *.txt
 *.bat
 *.csv
+
+# Build artifacts
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.spec.bak
+*.egg-info/
+
+# PyInstaller
+*.spec
+
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Icon cache / generated
+browsar.ico
+logo.png

@@ -16,6 +16,13 @@ import csv
 import customtkinter as ctk
 from tkinter import messagebox, ttk, filedialog
 import tkinter as _tk
+import threading as _threading
+try:
+    import pystray as _pystray
+    from PIL import Image as _PilImage, ImageDraw as _PilDraw, ImageFont as _PilFont, ImageTk as _PilImageTk
+    _HAS_TRAY = True
+except ImportError:
+    _HAS_TRAY = False
 from Cryptodome.Cipher import AES
 import win32crypt
 import win32security
@@ -209,6 +216,33 @@ _BROWSER_ACCENT = {
     "Edge":        "#0078d4",
     "Tor Browser": "#7d4698",
 }
+_BASE_DIR  = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+_LOGO_PATH = os.path.join(_BASE_DIR, "logo.png")
+
+def _open_logo(target_size=None):
+    """Load logo.png, crop to icon square only, optionally resize. Returns PIL Image or None."""
+    if not (_HAS_TRAY and os.path.exists(_LOGO_PATH)):
+        return None
+    try:
+        img = _PilImage.open(_LOGO_PATH).convert("RGBA")
+        w, h = img.size
+        # Remove bottom ~24% (text/branding below the icon square)
+        img = img.crop((0, 0, w, int(h * 0.76)))
+        w, h = img.size
+        # Remove outer dark margins (~11% sides, 7% top)
+        mx, my = int(w * 0.11), int(h * 0.07)
+        img = img.crop((mx, my, w - mx, h - my))
+        # Center-crop to square
+        w, h = img.size
+        if w != h:
+            s = min(w, h)
+            img = img.crop(((w - s) // 2, (h - s) // 2,
+                             (w - s) // 2 + s, (h - s) // 2 + s))
+        if target_size:
+            img = img.resize((target_size, target_size), _PilImage.LANCZOS)
+        return img
+    except Exception:
+        return None
 
 # --- 4. ANALYSIS POPUP WINDOW ---
 class AnalysisWindow(ctk.CTkToplevel):
@@ -297,6 +331,10 @@ class BrowsAR_App(ctk.CTk):
         self.last_headers = []
         self._sidebar_btns = {}
         self._active_theme = "dark"
+        self._tray_icon = None
+        self._rebuilding = False
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind("<Unmap>", self._on_unmap)
 
         # ── sidebar ─────────────────────────────────────────────────────
         self._build_sidebar()
@@ -305,6 +343,8 @@ class BrowsAR_App(ctk.CTk):
         self.main_view = ctk.CTkFrame(self, corner_radius=0, fg_color=_C["bg"])
         self.main_view.pack(side="right", fill="both", expand=True)
         self._draw_welcome()
+        if _HAS_TRAY:
+            self.after(500, self._setup_tray)
 
     def _draw_welcome(self):
         for w in self.main_view.winfo_children():
@@ -330,7 +370,14 @@ class BrowsAR_App(ctk.CTk):
 
         # logo block
         logo_frame = ctk.CTkFrame(self.sidebar, fg_color=_C["surface"], corner_radius=0)
-        logo_frame.pack(fill="x", pady=(28, 20), padx=20)
+        logo_frame.pack(fill="x", pady=(12, 16), padx=16)
+        _logo_img = _open_logo(48)
+        if _logo_img is not None:
+            try:
+                _ctk_logo = ctk.CTkImage(light_image=_logo_img, dark_image=_logo_img, size=(48, 48))
+                ctk.CTkLabel(logo_frame, image=_ctk_logo, text="").pack(anchor="w", pady=(0, 6))
+            except Exception:
+                pass
         ctk.CTkLabel(logo_frame, text="Brows-AR",
                      font=(_C["sans"], 22, "bold"),
                      text_color=_C["text"]).pack(anchor="w")
@@ -407,6 +454,7 @@ class BrowsAR_App(ctk.CTk):
         self.after(10, self._apply_theme_rebuild)
 
     def _apply_theme_rebuild(self):
+        self._rebuilding = True
         self.withdraw()               # hide window to prevent visible flicker
         self.sidebar.destroy()
         self._build_sidebar()
@@ -418,6 +466,70 @@ class BrowsAR_App(ctk.CTk):
             self._draw_welcome()
         self.update_idletasks()        # flush all layout before revealing
         self.deiconify()               # show fully-rebuilt window at once
+        self._rebuilding = False
+
+    # ── system tray ──────────────────────────────────────────────────
+    def _make_tray_img(self):
+        """Tray icon: uses logo.png if available, else generated blue box."""
+        logo = _open_logo(64)
+        if logo is not None:
+            return logo
+        # fallback – generated blue rounded box with "AR"
+        sz  = 64
+        img = _PilImage.new("RGBA", (sz, sz), (0, 0, 0, 0))
+        d   = _PilDraw.Draw(img)
+        d.rounded_rectangle([0, 0, sz - 1, sz - 1], radius=10, fill="#4272d4")
+        fnt = None
+        for face in ("arialbd.ttf", "arial.ttf", "segoeui.ttf"):
+            try:
+                fnt = _PilFont.truetype(face, 28); break
+            except Exception:
+                pass
+        txt = "AR"
+        try:
+            bbox = d.textbbox((0, 0), txt, font=fnt)
+        except AttributeError:
+            w, h = d.textsize(txt, font=fnt)  # Pillow < 8
+            bbox = (0, 0, w, h)
+        x = (sz - (bbox[2] - bbox[0])) // 2 - bbox[0]
+        y = (sz - (bbox[3] - bbox[1])) // 2 - bbox[1]
+        d.text((x, y), txt, fill="white", font=fnt)
+        return img
+
+    def _setup_tray(self):
+        """Start pystray icon in background thread (runs for app lifetime)."""
+        def _show(icon=None, item=None):
+            self.after(0, self.deiconify)
+            self.after(20, self.lift)
+
+        def _quit(icon, item):
+            if self._tray_icon:
+                self._tray_icon.stop()
+            self.after(0, self.destroy)
+
+        menu = _pystray.Menu(
+            _pystray.MenuItem("Show BrowsAR", _show, default=True),
+            _pystray.Menu.SEPARATOR,
+            _pystray.MenuItem("Quit", _quit),
+        )
+        self._tray_icon = _pystray.Icon(
+            "BrowsAR", self._make_tray_img(),
+            "Brows-AR  |  Browser Forensic Suite", menu,
+        )
+        _threading.Thread(target=self._tray_icon.run, daemon=True).start()
+
+    def _on_close(self):
+        """X button → hide to tray, do not destroy."""
+        self.withdraw()
+
+    def _on_unmap(self, event):
+        """Minimize button → hide to tray."""
+        if event.widget is self and not self._rebuilding:
+            self.after(50, self._hide_if_iconic)
+
+    def _hide_if_iconic(self):
+        if self.state() == "iconic":
+            self.withdraw()
 
     def load_browser_cockpit(self, name, path):
         self.current_browser_name, self.current_browser_path = name, path
@@ -1738,9 +1850,83 @@ class BrowsAR_App(ctk.CTk):
                 f_out.write(html)
             messagebox.showinfo("Brows-AR", "Export Complete")
 
+def _run_splash(app):
+    """Ghidra-style logo splash: fades in then out before main window shows."""
+    raw = _open_logo(240)
+    if raw is None:
+        app.wm_attributes("-alpha", 1.0)
+        app.lift()
+        return
+    try:
+        tk_img = _PilImageTk.PhotoImage(raw)
+    except Exception:
+        app.wm_attributes("-alpha", 1.0)
+        app.lift()
+        return
+
+    w, h = 320, 360
+    splash = _tk.Toplevel(app)
+    splash.overrideredirect(True)
+    splash.configure(bg="#0d0d0d")
+    splash.attributes("-alpha", 0.0)
+    splash.attributes("-topmost", True)
+    sw, sh = app.winfo_screenwidth(), app.winfo_screenheight()
+    splash.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+
+    # Win11 rounded corners via DWM
+    try:
+        DWMWA_WINDOW_CORNER_PREFERENCE = 33
+        DWMWCP_ROUND = 2
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            ctypes.windll.user32.GetParent(splash.winfo_id()),
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            ctypes.byref(ctypes.c_int(DWMWCP_ROUND)),
+            ctypes.sizeof(ctypes.c_int),
+        )
+    except Exception:
+        pass
+
+    # Canvas guarantees pixel-perfect centering regardless of widget sizes
+    canvas = _tk.Canvas(splash, width=w, height=h, bg="#0d0d0d",
+                        highlightthickness=0, bd=0)
+    canvas.pack(fill="both", expand=True)
+    canvas._tk_img = tk_img  # keep reference to prevent GC
+
+    img_cy = h // 2 - 30          # center of the logo image
+    canvas.create_image(w // 2, img_cy, image=tk_img, anchor="center")
+    canvas.create_text(w // 2, img_cy + 142,
+                       text="BrowsAR",
+                       font=("Segoe UI", 20, "bold"), fill="#4f8ef7")
+    canvas.create_text(w // 2, img_cy + 170,
+                       text="Browser Forensic Suite",
+                       font=("Segoe UI", 10), fill="#555555")
+    splash.update()
+
+    def _fade_in(a=0.0):
+        if a < 1.0:
+            splash.attributes("-alpha", round(min(a, 1.0), 2))
+            splash.after(20, lambda: _fade_in(round(a + 0.05, 2)))
+        else:
+            splash.after(1400, _fade_out)
+
+    def _fade_out(a=1.0):
+        if a > 0.0:
+            splash.attributes("-alpha", round(a, 2))
+            splash.after(20, lambda: _fade_out(round(a - 0.05, 2)))
+        else:
+            splash.destroy()
+            app.wm_attributes("-alpha", 1.0)
+            app.lift()
+            app.focus_force()
+
+    _fade_in()
+
+
 if __name__ == "__main__":
     if not is_admin():
         ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
     else:
         app = BrowsAR_App()
+        app.wm_attributes("-alpha", 0.0)  # invisible but not withdrawn - Toplevels still work
+        _run_splash(app)
         app.mainloop()
